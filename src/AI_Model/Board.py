@@ -4,10 +4,10 @@ import numpy as np
 from Snake import Snake
 
 # REWARD VALUES
-INSTANT_GAMEOVER = -10  # Reduced from -100 to prevent loss explosion
-GREEN_APPLE = 10       # Good reward for eating
-RED_APPLE = -5         # Not used anymore (no red apples)
-NO_EAT = -0.01         # Very small penalty to encourage exploration
+INSTANT_GAMEOVER = -50  # Reduced from -100 to prevent loss explosion
+GREEN_APPLE = 30       # Good reward for eating green apples
+RED_APPLE = -10        # Medium penalty for eating red apples
+NO_EAT = -0.1        # Very small penalty to encourage exploration
 
 class Board ():
     def __init__(self, boardSize: int):
@@ -107,27 +107,24 @@ class Board ():
         view = [[], [], [], []]  # [UP, DOWN, LEFT, RIGHT] - matches action indices!
 
         # UP view (cells above head) - index 0
-        for cell in range(0, snake_head_x):
+        # From closest to farthest
+        for cell in range(snake_head_x - 1, -1, -1):
             view[0].append(self.board[cell][snake_head_y])
         
         # DOWN view (cells below head) - index 1
+        # From closest to farthest
         for cell in range(snake_head_x + 1, self.boardSize):
             view[1].append(self.board[cell][snake_head_y])
         
         # LEFT view (cells to the left of head) - index 2
-        for cell in range(0, snake_head_y):
+        # From closest to farthest
+        for cell in range(snake_head_y - 1, -1, -1):
             view[2].append(self.board[snake_head_x][cell])
         
         # RIGHT view (cells to the right of head) - index 3
+        # From closest to farthest
         for cell in range(snake_head_y + 1, self.boardSize):
             view[3].append(self.board[snake_head_x][cell])
-        
-        # Debug: Print in cross format (optional, only if needed)
-        # Uncomment these lines to visualize the snake's view
-        # print(' ' * len(view[2]) + ''.join(view[0]))  # UP
-        # print(''.join(view[2]) + 'H' + ''.join(view[3]))  # LEFT + HEAD + RIGHT
-        # print(' ' * len(view[2]) + ''.join(view[1]))  # DOWN
-        # print()  # Empty line
         
         return view
 
@@ -152,7 +149,6 @@ class Board ():
         return None
     
     def move_snake(self, direction: str):
-        print(direction, '\n')
         # Calculate new head position based on direction
         old_head_x = self.snake.head[0]
         old_head_y = self.snake.head[1]
@@ -224,18 +220,28 @@ class Board ():
     
     def get_distance_to_closest_food(self):
         """Calculate Manhattan distance to closest green apple"""
+        dx, dy = self.get_relative_food_pos()
+        return abs(dx) + abs(dy)
+
+    def get_relative_food_pos(self):
+        """Returns (dx, dy) to the closest green apple"""
         if not self.food:
-            return 0
+            return 0, 0
         
         head_x, head_y = self.snake.head
         min_dist = float('inf')
+        closest_dx, closest_dy = 0, 0
         
         for food_x, food_y, food_type in self.food:
-            if food_type == 'G':  # Only consider green apples
-                dist = abs(head_x - food_x) + abs(head_y - food_y)
-                min_dist = min(min_dist, dist)
+            if food_type == 'G':
+                dx = food_x - head_x
+                dy = food_y - head_y
+                dist = abs(dx) + abs(dy)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_dx, closest_dy = dx, dy
         
-        return min_dist if min_dist != float('inf') else 0
+        return closest_dx, closest_dy
         
     def print_colored_board(self):
         COLORS = {
@@ -257,7 +263,7 @@ class Board ():
 
 
     def reset(self):
-        self.board = np.zeros((self.boardSize, self.boardSize), dtype=int)
+        self.board = np.zeros((self.boardSize, self.boardSize), dtype=str)
 
     def get_state(self):
         return self.board

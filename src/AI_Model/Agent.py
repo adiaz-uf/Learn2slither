@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 from keras import Sequential, layers, optimizers, losses
+from collections import deque
+import random
 
 CHAR_MAP = {
     '0': 0,  # Empty
@@ -8,185 +10,150 @@ CHAR_MAP = {
     'S': 2,  # Snake Body
     'G': 3,  # Green Apple
     'R': 4,  # Red Apple
-    'H': 5   # Head (though head is not in the view usually)
+    'H': 5   # Head
 }
 
 class Agent:
-    def __init__(self, board_size, learning_rate=0.001, gamma=0.95, debug=False):
+    def __init__(self, board_size, learning_rate=0.0005, gamma=0.995, debug=False):
         self.board_size = board_size
         self.gamma = gamma
         self.output_size = 4  # UP, DOWN, LEFT, RIGHT
-        self.input_size = 4 * board_size
-        self.optimizer = optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)  # Add gradient clipping
+        # One-Hot: 4 directions * board_size cells * 6 possible categories
+        self.num_categories = 6
+        self.input_size = 4 * board_size * self.num_categories
+        
+        self.optimizer = optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
         self.loss_fn = losses.MeanSquaredError()
         self.debug = debug
-        self.train_count = 0  # Counter for training steps
-
-        # Build the Neural Network (with batch normalization for better learning)
-        self.model = Sequential([
-            layers.Input(shape=(self.input_size,)),
-            layers.Dense(64, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dense(32, activation='relu'),
-            layers.Dense(self.output_size, activation='linear') 
-            # Linear activation for the output because Q-values can be anything
-        ])
+        self.train_count = 0
         
-        if self.debug:
-            print(f"\n{'='*60}")
-            print(f"🔧 Agent initialized:")
-            print(f"  Board size: {board_size}")
-            print(f"  Input size: {self.input_size} (4 directions × {board_size})")
-            print(f"  Output size: {self.output_size}")
-            print(f"  Learning rate: {learning_rate}")
-            print(f"  Gamma: {gamma}")
-            print(f"{'='*60}\n")
+        # Experience Replay Memory
+        self.memory = deque(maxlen=50000)
+        self.batch_size = 256
+        self.target_update_frequency = 1000 # steps
+        
+        # Main Model (the one we train)
+        self.model = self._build_model()
+        
+        # Target Model (the one we use for targets, periodic updates)
+        self.target_model = self._build_model()
+        self.update_target_model()
+
+    def _build_model(self):
+        model = Sequential([
+            layers.Input(shape=(self.input_size,)),
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(0.1), # Slight dropout to prevent overfitting to specific board positions
+            layers.Dense(128, activation='relu'),
+            layers.Dense(self.output_size, activation='linear')
+        ])
+        return model
+
+    def update_target_model(self):
+        """Copies weights from main model to target model"""
+        self.target_model.set_weights(self.model.get_weights())
 
     def process_view_tf(self, view, board_size):
         """
-        Converts the raw view lists into a NumPy array suitable for TensorFlow.
-        Returns shape: (1, 4 * board_size)
+        Converts raw view into a One-Hot encoded vector.
+        Each cell becomes a [0,0,0,0,0,0] vector with a 1 in the category index.
         """
-        input_vector = []
+        # Create a zero matrix [Total_Cells, 6_Categories]
+        total_cells = 4 * board_size
+        one_hot_matrix = np.zeros((total_cells, self.num_categories), dtype=np.float32)
         
-        for i, arm in enumerate(view):
-            # Map chars to ints
-            num_arm = [CHAR_MAP.get(c, 0) for c in arm]
+        cell_idx = 0
+        for arm in view:
+            # Truncate arm to agent's board_size (Option 1)
+            arm_truncated = list(arm[:board_size])
             
-            # Pad with 0s to reach board_size
-            padding = [0] * (board_size - len(num_arm))
+            # Virtual Wall logic: If no wall is seen in the 10-cell range, 
+            # place a virtual wall at the last cell to simulate 10x10 boundaries.
+            # This prevents the IA from getting lost in large empty spaces.
+            if len(arm_truncated) == board_size and 'W' not in arm_truncated:
+                arm_truncated[-1] = 'W'
+
+            # Convert arm chars to indices
+            for c in arm_truncated:
+                if cell_idx < total_cells:
+                    cat_idx = CHAR_MAP.get(str(c).strip()[-1], 0)
+                    one_hot_matrix[cell_idx, cat_idx] = 1.0
+                    cell_idx += 1
             
-            # Extend the vector
-            final_arm = num_arm + padding
-            
-            # Safety truncate
-            input_vector.extend(final_arm[:board_size])
-        
-        # Convert to numpy and normalize to [0, 1] range
-        result = np.array(input_vector, dtype=np.float32).reshape(1, -1)
-        result = result / 5.0  # Max value in CHAR_MAP is 5 (H)
-        
-        # Debug first call
-        if self.debug and self.train_count == 0:
-            print(f"\n🔍 DEBUG process_view_tf (first call):")
-            print(f"  Raw view: {view}")
-            print(f"  View lengths: {[len(arm) for arm in view]}")
-            print(f"  Processed input shape: {result.shape}")
-            print(f"  Input sample (first 20 values): {result[0][:20]}")
-            print(f"  Input min/max: {result.min():.2f} / {result.max():.2f}")
-        
-        return result
+            # Padding for the arm if it's shorter than board_size (e.g. near walls)
+            remaining_in_arm = board_size - (cell_idx % board_size)
+            if remaining_in_arm < board_size:
+                cell_idx += remaining_in_arm
+
+        # Flatten to [1, 4 * board_size * 6]
+        return one_hot_matrix.flatten().reshape(1, -1)
 
     def get_action(self, view, epsilon=0):
-        """
-        Decides the move based on Epsilon-Greedy strategy.
-        """
-        # Exploration
         if np.random.rand() < epsilon:
-            action = np.random.randint(0, self.output_size)
-            if self.debug and self.train_count < 3:
-                print(f"  🎲 Exploration: random action {action}")
-            return action
+            return np.random.randint(0, self.output_size)
             
-        # Exploitation (Prediction)
         state = self.process_view_tf(view, self.board_size)
-        
-        # training=False ensures layers like Dropout (if any) behave correctly
-        pred_q_values = self.model(state, training=False) 
-        
-        # Debug first few predictions
-        if self.debug and self.train_count < 3:
-            print(f"\n🔍 DEBUG get_action:")
-            print(f"  Q-values: {pred_q_values[0].numpy()}")
-            print(f"  Max Q: {np.max(pred_q_values[0]):.3f}")
-            print(f"  Selected action: {np.argmax(pred_q_values[0])}")
-        
-        # Argmax returns the index of the best move
+        pred_q_values = self.model(state, training=False)
         return np.argmax(pred_q_values[0])
-    
-    @tf.function # This decorator speeds up execution by compiling the graph
-    def _train_step_compiled(self, state, action_idx, target_q):
-        """
-        Internal compiled function to update weights.
-        Using GradientTape allows us to control exactly which gradients to update.
-        """
+
+    def remember(self, state_view, action, reward, next_state_view, done):
+        """Store experiences in memory"""
+        self.memory.append((state_view, action, reward, next_state_view, done))
+
+    @tf.function
+    def _train_step_compiled(self, states, actions, targets):
         with tf.GradientTape() as tape:
-            # 1. Predict Q-values for the current state
-            q_values = self.model(state, training=True)
+            all_q_values = self.model(states, training=True)
+            masks = tf.one_hot(actions, self.output_size)
+            current_qs = tf.reduce_sum(all_q_values * masks, axis=1)
+            loss = self.loss_fn(targets, current_qs)
             
-            # 2. Create a mask so we only calculate loss for the action taken
-            # We want: Loss = (Q_target - Q_predicted[action])^2
-            # But Keras loss functions expect shape matches.
-            # So we create a "one_hot" mask to pick just the relevant Q-value.
-            
-            one_hot_action = tf.one_hot(action_idx, self.output_size)
-            
-            # We multiply by the mask to isolate the Q-value of the action taken
-            current_q = tf.reduce_sum(q_values * one_hot_action, axis=1)
-            
-            # Calculate loss
-            loss = self.loss_fn(target_q, current_q)
-            
-        # 3. Calculate Gradients and Update
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
         return loss
 
-    def train(self, current_view, action_idx, reward, next_view, done):
-        """
-        Orchestrates the Bellman Equation calculation and calls the training step.
-        """
+    def replay(self):
+        """Train on a batch of experiences from memory"""
+        if len(self.memory) < self.batch_size:
+            return None
+            
+        minibatch = random.sample(self.memory, self.batch_size)
+        
+        states = []
+        next_states = []
+        actions = []
+        rewards = []
+        dones = []
+        
+        for sv, a, r, nsv, d in minibatch:
+            states.append(self.process_view_tf(sv, self.board_size)[0])
+            next_states.append(self.process_view_tf(nsv, self.board_size)[0])
+            actions.append(a)
+            rewards.append(r)
+            dones.append(d)
+            
+        states = np.array(states)
+        next_states = np.array(next_states)
+        actions = np.array(actions, dtype=np.int32)
+        rewards = np.array(rewards, dtype=np.float32)
+        dones = np.array(dones, dtype=np.float32)
+        
+        # Use target network for stability
+        next_q_values = self.target_model(next_states, training=False)
+        max_next_q = np.max(next_q_values, axis=1)
+        
+        targets = rewards + (1 - dones) * self.gamma * max_next_q
+        
+        loss = self._train_step_compiled(states, actions, targets)
         self.train_count += 1
         
-        # Convert inputs to Tensors/Arrays
-        state = self.process_view_tf(current_view, self.board_size)
-        next_state = self.process_view_tf(next_view, self.board_size)
-        
-        # 1. Calculate the Target Q-Value (Bellman Equation)
-        # Q_new = r + gamma * max(Q(next_state))
-        
-        target_q = reward
-        if not done:
-            next_q_values = self.model(next_state, training=False)
-            max_next_q = np.max(next_q_values[0])
-            target_q = reward + self.gamma * max_next_q
-        
-        # Debug first few training steps
-        if self.debug and self.train_count <= 3:
-            print(f"\n🔍 DEBUG train (step {self.train_count}):")
-            print(f"  Action: {action_idx} ({'UP' if action_idx==0 else 'DOWN' if action_idx==1 else 'LEFT' if action_idx==2 else 'RIGHT'})")
-            print(f"  Reward: {reward}")
-            print(f"  Done: {done}")
-            if not done:
-                print(f"  Next Q-values: {next_q_values[0].numpy()}")
-                print(f"  Max next Q: {max_next_q:.3f}")
-            print(f"  Target Q: {target_q:.3f}")
-        
-        # Convert target to tensor for the graph
-        target_q_tensor = tf.convert_to_tensor([target_q], dtype=tf.float32)
-        
-        # 2. Run the optimization step
-        loss = self._train_step_compiled(state, action_idx, target_q_tensor)
-        
-        # Debug loss
-        if self.debug and self.train_count <= 3:
-            print(f"  Loss: {loss.numpy():.6f}")
-        
-        # Print every 100 training steps
-        if self.debug and self.train_count % 100 == 0:
-            # Get current Q-values to see if network is learning
-            current_q_values = self.model(state, training=False)
-            print(f"\n📊 Training step {self.train_count}:")
-            print(f"  Loss: {loss.numpy():.6f}")
-            print(f"  Q-values: {current_q_values[0].numpy()}")
-            print(f"  Q-value range: [{current_q_values[0].numpy().min():.2f}, {current_q_values[0].numpy().max():.2f}]")
-        if not done:
-            next_q_values = self.model(next_state, training=False)
-            max_next_q = np.max(next_q_values[0])
-            target_q = reward + self.gamma * max_next_q
-        
-        # Convert target to tensor for the graph
-        target_q_tensor = tf.convert_to_tensor([target_q], dtype=tf.float32)
-        
-        # 2. Run the optimization step
-        loss = self._train_step_compiled(state, action_idx, target_q_tensor)
+        # Periodic update of target model
+        if self.train_count % self.target_update_frequency == 0:
+            self.update_target_model()
+            if self.debug:
+                print(f"🔄 Target model updated at step {self.train_count}")
+                
+        return loss.numpy()
+
+    def train(self, current_view, action_idx, reward, next_view, done):
+        pass

@@ -13,6 +13,30 @@ from Agent import Agent
 from Board import Board
 
 
+def print_snake_vision(view, step, board_size):
+    """Prints the snake view in a simple cross layout with only board characters"""
+    # Extract only the last character (0, W, S, G, R)
+    clean = [[str(cell).strip()[-1] for cell in arm] for arm in view]
+    up, down, left, right = clean
+    
+    # Build horizontal part to calculate indentation
+    left_str = "".join(reversed(left))
+    right_str = "".join(right)
+    indent = " " * len(left_str)
+    
+    print(f"\n--- Step {step} ---")
+    # Print UP (farthest cell first)
+    for cell in reversed(up):
+        print(f"{indent}{cell}")
+    
+    # Print Middle Row
+    print(f"{left_str}H{right_str}")
+    
+    # Print DOWN (closes cell first)
+    for cell in down:
+        print(f"{indent}{cell}")
+
+
 def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=None, start_episode=0, debug=False):
     """
     Train the DQN agent
@@ -29,13 +53,14 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
     # Initialize agent if not provided
     if agent is None:
         agent = Agent(board_size=board_size, debug=debug)
-        epsilon = 1.0  # Start with full exploration
+        initial_epsilon = 1.0
     else:
-        # If continuing training, start with lower epsilon
-        epsilon = 0.3
+        # Starting low for pre-trained models
         agent.debug = debug
+        initial_epsilon = 0.005
     
-    epsilon_min = 0.01
+    epsilon = initial_epsilon
+    
     epsilon_decay = 0.995  # Slower decay
     
     # Statistics
@@ -77,12 +102,12 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
         
         step_count = 0
         episode_reward = 0
-        max_steps = board_size * board_size * 10  # Límite: 10x el tamaño del tablero
+        max_steps = board_size * board_size * 20  # Límite: 20x el tamaño del tablero
         
         # Loop detection: track last score change
         last_score = len(board.snake.body) + 1  # Initial snake length
         steps_since_food = 0
-        max_steps_without_food = board_size * board_size  # Must eat within this
+        max_steps_without_food = board_size * board_size * 2  # Must eat within this
         
         # Episode loop
         while True:
@@ -105,22 +130,13 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
             action_idx = agent.get_action(current_view, epsilon)
             move_str = directions_map[action_idx]
             
-            # Debug first 5 steps of first episode
-            if debug and episode_num == 0 and step_count <= 5:
-                print(f"\n🎯 Step {step_count}:")
-                print(f"  Snake head: {board.snake.head}")
-                print(f"  Snake body: {board.snake.body}")
-                print(f"  Action: {action_idx} ({move_str})")
-                print(f"  Food positions: {board.food}")
-                print(f"  Distance to food: {prev_distance}")
-            
             # 3. Execute action and get reward
             new_head, reward = board.move_snake(move_str)
             
             # Add distance-based reward shaping (encourage getting closer to food)
             if new_head is not None:  # Only if didn't die
                 new_distance = board.get_distance_to_closest_food()
-                distance_reward = (prev_distance - new_distance) * 0.1  # Small bonus for getting closer
+                distance_reward = (prev_distance - new_distance) * 0.2  # Small bonus for getting closer
                 reward += distance_reward
             
             episode_reward += reward
@@ -134,14 +150,6 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
             else:
                 steps_since_food += 1
             
-            # Debug reward
-            if debug and episode_num == 0 and step_count <= 5:
-                print(f"  Reward received: {reward}")
-                if reward == 10:
-                    print(f"  ✅ ATE GREEN APPLE!")
-                elif reward == -10:
-                    print(f"  ⚠️  ATE RED APPLE!")
-            
             # Check if game is over
             done = False
             if new_head is None:  # Collision
@@ -150,23 +158,21 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
             # Loop detection: terminate if stuck going in circles
             if steps_since_food >= max_steps_without_food:
                 done = True
-                reward = -5  # Small penalty for getting stuck
+                reward = -50  # Penalty for getting stuck
                 episode_reward += reward
-                if debug or episode_num < 5:
-                    print(f"  ⚠️  Stuck in loop! {steps_since_food} steps without eating")
             
             # Timeout: absolute maximum steps
             if step_count >= max_steps:
                 done = True
-                reward = -10  # Penalty for extreme timeout
+                reward = -50  # Penalty for extreme timeout
                 episode_reward += reward
-                print(f"  -> Hard timeout at step {step_count}")
             
             # 4. Get next state
             next_view = board.get_snake_view() if not done else current_view
             
-            # 5. Train the agent
-            agent.train(current_view, action_idx, reward, next_view, done)
+            # 5. Store experience and train the agent (Replay)
+            agent.remember(current_view, action_idx, reward, next_view, done)
+            loss = agent.replay()
             
             # 6. Update UI (if visualizing)
             if visualize:
@@ -175,7 +181,7 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
             
             # Episode finished
             if done:
-                final_score = len(board.snake.body)
+                final_score = len(board.snake.body) + 1
                 
                 # More detailed output for first 20 episodes
                 if episode_num < 20 or debug:
@@ -193,9 +199,45 @@ def train_agent(num_episodes=100, board_size=10, visualize=False, fps=10, agent=
                 stats['scores'].append(final_score)
                 if final_score > stats['high_score']:
                     stats['high_score'] = final_score
+                    # Save best model checkpoint
+                    best_model_path = f"models/best_snake_{board_size}x{board_size}_{num_episodes}ep.keras"
+                    os.makedirs("models", exist_ok=True)
+                    agent.model.save(best_model_path)
+                    
+                    # Save best model metadata
+                    best_metadata = {
+                        'board_size': board_size,
+                        'total_episodes': start_episode + episode_num + 1,
+                        'high_score': stats['high_score'],
+                        'average_score': stats['total_score'] / (episode_num + 1), # Current average
+                        'epsilon': epsilon,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    best_metadata_path = best_model_path.replace('.keras', '_metadata.json')
+                    with open(best_metadata_path, 'w') as f:
+                        json.dump(best_metadata, f, indent=2)
+                        
+                    print(f"  🏆 New High Score! Best model saved to: {best_model_path}")
                 
-                # Decay epsilon
-                epsilon = max(epsilon_min, epsilon * epsilon_decay)
+                # Decay epsilon (Linear Professional Schedule)
+                # 1. Warmup: Keep at initial_epsilon for first 10% of sessions
+                warmup_episodes = int(num_episodes * 0.10)
+                # 2. Linear Decay: Fall to minimum at 60% of total sessions
+                decay_end_episode = int(num_episodes * 0.70)
+                epsilon_target = 0.005
+                
+                if episode_num < warmup_episodes:
+                    epsilon = initial_epsilon
+                elif episode_num < decay_end_episode:
+                    # Linear interpolation from initial_epsilon to epsilon_target
+                    progress = (episode_num - warmup_episodes) / (decay_end_episode - warmup_episodes)
+                    epsilon = initial_epsilon - progress * (initial_epsilon - epsilon_target)
+                else:
+                    # Oscillation phase: spike to 0.02 every 5 episodes to avoid local minima
+                    if (episode_num - decay_end_episode) % 1000 == 0:
+                        epsilon = 0.02
+                    else:
+                        epsilon = epsilon_target
                 break
         
         # Print progress every 10 episodes
@@ -243,6 +285,9 @@ def evaluate_agent(agent, board_size=10, num_games=10, visualize=True, fps=10):
             board.initialize()
         
         step_count = 0
+        last_score = len(board.snake.body) + 1
+        steps_since_food = 0
+        max_steps_without_food = board_size * board_size
         max_steps = board_size * board_size * 10
         
         while True:
@@ -254,32 +299,50 @@ def evaluate_agent(agent, board_size=10, num_games=10, visualize=True, fps=10):
                         return scores
                 board = game_ui.board
             
-            # Get state and action (no exploration, epsilon=0)
+            # 1. Show vision
             current_view = board.get_snake_view()
+            print_snake_vision(current_view, step_count, board_size)
+            
+            # 2. Algorithm decides
             action_idx = agent.get_action(current_view, epsilon=0)  # Pure exploitation
             move_str = directions_map[action_idx]
-            
+            print(f"Algorithm Decision -> [ {move_str} ]")
+            print("="*30)
             # Execute action
             new_head, reward = board.move_snake(move_str)
+            
+            # Track score changes for loop detection
+            current_score = len(board.snake.body) + 1
+            if current_score != last_score:
+                steps_since_food = 0
+                last_score = current_score
+            else:
+                steps_since_food += 1
             
             if visualize:
                 game_ui._update_ui()
                 game_ui.clock.tick(fps)
             
-            # Check game over
-            if new_head is None or step_count >= max_steps:
-                final_score = len(board.snake.body)
+            # Check game over (collision or loop)
+            done = False
+            if new_head is None or step_count >= max_steps or steps_since_food >= max_steps_without_food:
+                done = True
+                
+            if done:
+                final_score = len(board.snake.body) + 1
                 scores.append(final_score)
-                print(f"Game {game_num + 1} finished: Steps={step_count}, Score={final_score}")
+                reason = "Collision" if new_head is None else "Loop/Timeout"
+                print(f"Game {game_num + 1} finished ({reason}): Steps={step_count}, Score={final_score}")
                 break
     
     # Print evaluation results
     print(f"\n{'='*60}")
     print(f"=== Evaluation Complete ===")
     print(f"Games Played: {len(scores)}")
-    print(f"Average Score: {sum(scores) / len(scores):.2f}")
-    print(f"Best Score: {max(scores)}")
-    print(f"Worst Score: {min(scores)}")
+    if scores:
+        print(f"Average Score: {sum(scores) / len(scores):.2f}")
+        print(f"Best Score: {max(scores)}")
+        print(f"Worst Score: {min(scores)}")
     print(f"{'='*60}\n")
     
     return scores
@@ -307,6 +370,9 @@ def run_with_ui(agent, board_size=10):
     directions_map = ['UP', 'DOWN', 'LEFT', 'RIGHT']
     
     step_count = 0
+    last_score = len(game_ui.board.snake.body) + 1
+    steps_since_food = 0
+    max_steps_without_food = board_size * board_size
     max_steps = board_size * board_size * 10
     
     while True:
@@ -317,22 +383,46 @@ def run_with_ui(agent, board_size=10):
                 pygame.quit()
                 return
         
-        # Get action from agent
+        # 1. Show vision
         current_view = game_ui.board.get_snake_view()
+        print_snake_vision(current_view, step_count, board_size)
+        
+        # 2. Algorithm decides
         action_idx = agent.get_action(current_view, epsilon=0)
         move_str = directions_map[action_idx]
-        
+        print(f"Algorithm Decision -> [ {move_str} ]")
+        print("="*30)
         # Execute action
         new_head, reward = game_ui.board.move_snake(move_str)
         
+        # Track score changes for loop detection
+        current_score = len(game_ui.board.snake.body) + 1
+        if current_score != last_score:
+            steps_since_food = 0
+            last_score = current_score
+        else:
+            steps_since_food += 1
+            
         # Update UI
         game_ui._update_ui()
         game_ui.clock.tick(10)
         
-        # Check game over
-        if new_head is None or step_count >= max_steps:
-            final_score = len(game_ui.board.snake.body)
-            print(f"Game finished: Steps={step_count}, Score={final_score}")
+        # Check game over (collision or loop)
+        done = False
+        reason = ""
+        if new_head is None:
+            done = True
+            reason = "Collision"
+        elif steps_since_food >= max_steps_without_food:
+            done = True
+            reason = "Stagnation (Loop)"
+        elif step_count >= max_steps:
+            done = True
+            reason = "Hard Timeout"
+
+        if done:
+            final_score = len(game_ui.board.snake.body) + 1
+            print(f"Game finished ({reason}): Steps={step_count}, Score={final_score}")
             
             # Show game over screen
             game_over_screen = GameOverScreen(final_score)
@@ -395,7 +485,8 @@ if __name__ == "__main__":
     
     if args.load:
         print(f"Loading model from: {args.load}")
-        agent = Agent(board_size=board_size)
+        # Use board_size 10 for the agent to match the trained model's input size (Option 1)
+        agent = Agent(board_size=10)
         
         try:
             from tensorflow import keras
@@ -426,7 +517,7 @@ if __name__ == "__main__":
             run_with_ui(agent, board_size)
         else:
             # Simple evaluation
-            evaluate_agent(agent, board_size, num_games=10, visualize=False)
+            evaluate_agent(agent, board_size, num_games=args.sessions, visualize=False)
     
     else:
         # Training mode

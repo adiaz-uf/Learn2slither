@@ -301,28 +301,20 @@ class BoardGameUI:
             return 0, True, self.score
         
         # Get current snake length
-        old_length = len(self.board.snake.body)
-
-        self.board.get_snake_view()
-        result, reward = self.board.move_snake(direction)
-        print(reward)
+        move_result, move_reward = self.board.move_snake(direction)
         
-        if result is None:
+        if move_result is None:
             self.game_over = True
-            return -10, True, self.score
+            return move_reward, True, self.score
         
-        # Update score based on length change
-        new_length = len(self.board.snake.body)
-        reward = 0
+        # Update internal score only if it was a positive reward (green apple)
+        # or negative (red apple) to keep UI score in sync with logic
+        if move_reward == 10:
+            self.score += 10
+        elif move_reward == -5:
+            self.score = max(0, self.score - 5)
         
-        if new_length > old_length:
-            self.score += 10  # Green apple
-            reward = 10
-        elif new_length < old_length:
-            self.score -= 5   # Red apple
-            reward = -5
-        
-        return reward, False, self.score
+        return move_reward, False, self.score
     
     def draw_cell(self, x, y, color):
         """Draw a single cell on the board"""
@@ -360,6 +352,9 @@ class BoardGameUI:
                     self.draw_cell(i, j, RED)
                 elif cell == '0':  # Empty
                     self.draw_cell(i, j, BLACK)
+        
+        # Update score based on actual snake length (head + body)
+        self.score = len(self.board.snake.body) + 1
         
         # Draw score
         score_text = self.font.render(f'Score: {self.score}', True, WHITE)
