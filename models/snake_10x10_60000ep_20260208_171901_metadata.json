@@ -1,0 +1,8 @@
+{
+  "board_size": 10,
+  "total_episodes": 60000,
+  "high_score": 46,
+  "average_score": 14.227633333333333,
+  "final_epsilon": 0.01,
+  "timestamp": "2026-02-08T17:19:01.426465"
+}

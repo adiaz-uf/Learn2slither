@@ -14,7 +14,7 @@ CHAR_MAP = {
 }
 
 class Agent:
-    def __init__(self, board_size, learning_rate=0.0005, gamma=0.995, debug=False):
+    def __init__(self, board_size, learning_rate=0.0005, gamma=0.999, debug=False):
         self.board_size = board_size
         self.gamma = gamma
         self.output_size = 4  # UP, DOWN, LEFT, RIGHT
