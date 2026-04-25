@@ -426,12 +426,6 @@ Constantes en [Board.py:13-16](src/AI_Model/Board.py#L13):
 | Colisión / loop / suicidio (red apple en cuerpo vacío) | `-100` | `INSTANT_GAMEOVER` | Señal de muerte fuerte             |
 | Timeout `max_steps`      | `-50`                 | (literal en main.py) | Episodio demasiado largo           |
 
-> **Nota sobre reward shaping**: una versión anterior añadía un bonus por
-> acercarse a la manzana verde (distancia Manhattan), pero requería leer
-> posiciones globales — información no visible en la cruz. El subject
-> penaliza con −42 dar al agente información extra al estado, así que el
-> shaping fue eliminado.
-
 La función de recompensa es **idéntica para los dos modos**. El snake percibe
 los mismos estímulos sin importar cómo se codifique su visión.
 
