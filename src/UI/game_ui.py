@@ -252,9 +252,11 @@ class StatsScreen:
 class BoardGameUI:
     """Pygame window that renders the game board driven by Board logic."""
 
-    # Fixed window size, reused for every board size. Cell pixel size
-    # shrinks for larger boards so the playable area always occupies the
-    # same screen area regardless of board size.
+    # Target window size, reused for every board size. Cell pixel size
+    # shrinks for larger boards so the playable area always occupies
+    # roughly the same screen area regardless of board size. The actual
+    # window is sized to BLOCK_SIZE * board_size so there is no black
+    # margin around the board.
     WINDOW_SIZE = 778
 
     def __init__(self, board_size=12):
@@ -266,8 +268,11 @@ class BoardGameUI:
         pygame.init()
         self.board_size = board_size
         self.BLOCK_SIZE = self.WINDOW_SIZE // board_size
-        self.w = self.WINDOW_SIZE
-        self.h = self.WINDOW_SIZE
+        # Use the exact board pixel size as the window size to avoid the
+        # leftover black strip on the right/bottom caused by
+        # WINDOW_SIZE not being divisible by board_size.
+        self.w = self.BLOCK_SIZE * board_size
+        self.h = self.BLOCK_SIZE * board_size
 
         self.display = pygame.display.set_mode((self.w, self.h))
         pygame.display.set_caption('Learn to Slither')

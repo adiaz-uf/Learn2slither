@@ -563,7 +563,7 @@ def evaluate_agent(
 # Full UI run (visual evaluation with lobby, game-over, stats screens)
 # ---------------------------------------------------------------------------
 
-def run_with_ui(agent, board_size, step_by_step=False):
+def run_with_ui(agent, board_size, step_by_step=False, fps=10):
     """
     Run an interactive evaluation session with the full pygame UI.
 
@@ -577,6 +577,7 @@ def run_with_ui(agent, board_size, step_by_step=False):
         board_size: fallback board size (used as the default selection;
                     in single mode it is the only allowed size).
         step_by_step: if True, pause after each game step.
+        fps: rendering speed (frames per second).
     """
     pygame.init()
     directions_map = ['UP', 'DOWN', 'LEFT', 'RIGHT']
@@ -647,7 +648,7 @@ def run_with_ui(agent, board_size, step_by_step=False):
                 steps_since_food += 1
 
             game_ui._update_ui()
-            game_ui.clock.tick(10)
+            game_ui.clock.tick(fps)
 
             done = False
             reason = ""
@@ -819,7 +820,11 @@ if __name__ == "__main__":
 
         if args.visual == 'on':
             pygame.init()
-            run_with_ui(agent, board_size, step_by_step=args.step_by_step)
+            run_with_ui(
+                agent, board_size,
+                step_by_step=args.step_by_step,
+                fps=args.fps,
+            )
         else:
             evaluate_agent(
                 agent,
