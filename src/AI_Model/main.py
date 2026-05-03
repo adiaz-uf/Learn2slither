@@ -30,7 +30,7 @@ from UI.game_ui import (  # noqa: E402
     StartScreen,
 )
 from Agent import Agent  # noqa: E402
-from Board import Board, INSTANT_GAMEOVER  # noqa: E402
+from Board import Board  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +119,15 @@ def train_agent(
     start_episode=0,
     debug=False,
     training_mode='single',
+    learning_rate=0.000216,
+    gamma=0.9646,
+    batch_size=512,
+    hidden_layers=None,
+    dropout_rate=None,
+    rewards=None,
+    intermediate_callback=None,
+    save_checkpoints=True,
+    verbose=True,
 ):
     """
     Train the DQN agent for a fixed number of episodes.
@@ -135,15 +144,37 @@ def train_agent(
         debug: print detailed debug output for the first 2 episodes.
         training_mode: 'single' (one fixed board size) or 'multi' (sample per
                        episode from [10, 14, 18]).
+        learning_rate, gamma, batch_size, hidden_layers, dropout_rate:
+            Agent hyperparameters; only applied when ``agent`` is None.
+        rewards: optional dict overriding any of GREEN_APPLE / RED_APPLE /
+                 NO_EAT / INSTANT_GAMEOVER on the Board instances.
+        intermediate_callback: optional callable f(episode, rolling_avg)
+            invoked every 100 episodes — used by Optuna to prune trials.
+            May raise an exception (e.g. optuna.TrialPruned) to stop early.
+        save_checkpoints: if False, do not write best/best-avg .keras files
+            (useful during tuning).
+        verbose: if False, suppress per-episode prints (Optuna runs).
 
     Returns:
         (agent, stats, final_epsilon)
     """
     if agent is None:
         if training_mode == 'multi':
-            agent = Agent(board_size=None, mode='multi', debug=debug)
+            agent = Agent(
+                board_size=None, mode='multi', debug=debug,
+                learning_rate=learning_rate, gamma=gamma,
+                batch_size=batch_size,
+                hidden_layers=hidden_layers,
+                dropout_rate=dropout_rate,
+            )
         else:
-            agent = Agent(board_size=board_size, mode='single', debug=debug)
+            agent = Agent(
+                board_size=board_size, mode='single', debug=debug,
+                learning_rate=learning_rate, gamma=gamma,
+                batch_size=batch_size,
+                hidden_layers=hidden_layers,
+                dropout_rate=dropout_rate,
+            )
         initial_epsilon = 1.0
     else:
         agent.debug = debug
@@ -161,26 +192,28 @@ def train_agent(
         'scores': [],
     }
 
-    print(f"\n{'=' * 60}")
-    if start_episode > 0:
-        print(f"Continuing training from episode {start_episode + 1}")
-    if training_mode == 'multi':
-        weights_pct = [int(w * 100) for w in MULTI_BOARD_WEIGHTS]
-        sizes_str = ", ".join(
-            f"{s}x{s} ({w}%)"
-            for s, w in zip(MULTI_BOARD_SIZES, weights_pct)
-        )
-        print(
-            f"Training (multi-size): {num_episodes} episodes — {sizes_str}"
-        )
-    else:
-        print(
-            f"Training: {num_episodes} episodes on "
-            f"{board_size}x{board_size} board"
-        )
-    if debug:
-        print("DEBUG MODE ENABLED")
-    print(f"{'=' * 60}\n")
+    if verbose:
+        print(f"\n{'=' * 60}")
+        if start_episode > 0:
+            print(f"Continuing training from episode {start_episode + 1}")
+        if training_mode == 'multi':
+            weights_pct = [int(w * 100) for w in MULTI_BOARD_WEIGHTS]
+            sizes_str = ", ".join(
+                f"{s}x{s} ({w}%)"
+                for s, w in zip(MULTI_BOARD_SIZES, weights_pct)
+            )
+            print(
+                f"Training (multi-size): "
+                f"{num_episodes} episodes — {sizes_str}"
+            )
+        else:
+            print(
+                f"Training: {num_episodes} episodes on "
+                f"{board_size}x{board_size} board"
+            )
+        if debug:
+            print("DEBUG MODE ENABLED")
+        print(f"{'=' * 60}\n")
 
     # Epsilon schedule parameters.
     # Fixed 200-episode warmup. Decay covers 35% of the remaining episodes
@@ -194,13 +227,17 @@ def train_agent(
         # In multi mode, the board size for this episode is sampled here
         current_board_size = _sample_board_size(training_mode, board_size)
 
-        if training_mode == 'multi':
-            print(f"\n=== Episode {start_episode + episode_num + 1}"
-                  f" | Epsilon: {epsilon:.3f}"
-                  f" | Board: {current_board_size}x{current_board_size} ===")
-        else:
-            print(f"\n=== Episode {start_episode + episode_num + 1}"
-                  f" | Epsilon: {epsilon:.3f} ===")
+        if verbose:
+            if training_mode == 'multi':
+                print(
+                    f"\n=== Episode {start_episode + episode_num + 1}"
+                    f" | Epsilon: {epsilon:.3f}"
+                    f" | Board: "
+                    f"{current_board_size}x{current_board_size} ==="
+                )
+            else:
+                print(f"\n=== Episode {start_episode + episode_num + 1}"
+                      f" | Epsilon: {epsilon:.3f} ===")
 
         # Enable detailed debug output for the first 2 episodes only
         agent.debug = debug and episode_num < 2
@@ -209,8 +246,12 @@ def train_agent(
         if visualize:
             game_ui = BoardGameUI(current_board_size + 2)
             board = game_ui.board
+            # Apply reward overrides to the UI-owned board too
+            if rewards:
+                for k, v in rewards.items():
+                    setattr(board, k, v)
         else:
-            board = Board(current_board_size + 2)
+            board = Board(current_board_size + 2, rewards=rewards)
             board.initialize()
 
         step_count = 0
@@ -275,7 +316,7 @@ def train_agent(
             if steps_since_food >= max_steps_without_food:
                 done = True
                 # Loop penalty matches the death penalty
-                reward = INSTANT_GAMEOVER
+                reward = board.INSTANT_GAMEOVER
                 episode_reward += reward
 
             if step_count >= max_steps:
@@ -299,20 +340,21 @@ def train_agent(
                 final_score = len(board.snake.body) + 1
 
                 ep_id = start_episode + episode_num + 1
-                if episode_num < 20 or debug:
-                    print(f"Episode {ep_id} finished:")
-                    print(f"  Steps: {step_count}")
-                    print(f"  Final Score: {final_score}")
-                    print(f"  Total Reward: {episode_reward:.1f}")
-                    avg = episode_reward / step_count
-                    print(f"  Avg Reward/step: {avg:.2f}")
-                else:
-                    print(
-                        f"Episode {ep_id} finished:"
-                        f" Steps={step_count},"
-                        f" Score={final_score},"
-                        f" Reward={episode_reward:.1f}"
-                    )
+                if verbose:
+                    if episode_num < 20 or debug:
+                        print(f"Episode {ep_id} finished:")
+                        print(f"  Steps: {step_count}")
+                        print(f"  Final Score: {final_score}")
+                        print(f"  Total Reward: {episode_reward:.1f}")
+                        avg = episode_reward / step_count
+                        print(f"  Avg Reward/step: {avg:.2f}")
+                    else:
+                        print(
+                            f"Episode {ep_id} finished:"
+                            f" Steps={step_count},"
+                            f" Score={final_score},"
+                            f" Reward={episode_reward:.1f}"
+                        )
 
                 stats['total_episodes'] += 1
                 stats['total_score'] += final_score
@@ -328,7 +370,7 @@ def train_agent(
                     model_dir = f"models/{board_size}x{board_size}"
                     name_tag = f"{board_size}x{board_size}"
 
-                if final_score > stats['high_score']:
+                if save_checkpoints and final_score > stats['high_score']:
                     stats['high_score'] = final_score
                     # Checkpoint: save the best model seen so far
                     best_path = (f"{model_dir}/best_snake_{name_tag}"
@@ -352,10 +394,14 @@ def train_agent(
                     )
                     with open(meta_path, 'w') as f:
                         json.dump(best_meta, f, indent=2)
-                    print(
-                        f"  New high score! "
-                        f"Best model saved to: {best_path}"
-                    )
+                    if verbose:
+                        print(
+                            f"  New high score! "
+                            f"Best model saved to: {best_path}"
+                        )
+                elif final_score > stats['high_score']:
+                    # Track high score even when not saving checkpoints
+                    stats['high_score'] = final_score
 
                 # Save model whenever the 200-episode rolling average
                 # improves, regardless of whether a new single-game high
@@ -363,7 +409,10 @@ def train_agent(
                 # never produce a lucky peak.
                 rolling_window = stats['scores'][-200:]
                 rolling_200 = sum(rolling_window) / max(1, len(rolling_window))
-                if rolling_200 > stats['best_rolling_avg']:
+                if (
+                    save_checkpoints
+                    and rolling_200 > stats['best_rolling_avg']
+                ):
                     stats['best_rolling_avg'] = rolling_200
                     avg_path = (
                         f"{model_dir}/best_avg_snake_{name_tag}"
@@ -386,10 +435,22 @@ def train_agent(
                     )
                     with open(avg_meta_path, 'w') as f:
                         json.dump(avg_meta, f, indent=2)
-                    print(
-                        f"  New best rolling avg ({rolling_200:.2f})! "
-                        f"Avg model saved to: {avg_path}"
-                    )
+                    if verbose:
+                        print(
+                            f"  New best rolling avg ({rolling_200:.2f})! "
+                            f"Avg model saved to: {avg_path}"
+                        )
+                elif rolling_200 > stats['best_rolling_avg']:
+                    # Track best rolling avg even when not saving checkpoints
+                    stats['best_rolling_avg'] = rolling_200
+
+                # Optuna pruning hook: report the rolling-200 avg every
+                # 100 episodes so unpromising trials can be cut early.
+                if (
+                    intermediate_callback is not None
+                    and (episode_num + 1) % 100 == 0
+                ):
+                    intermediate_callback(episode_num + 1, rolling_200)
 
                 break  # End of episode
 
@@ -417,13 +478,15 @@ def train_agent(
             cycle_pos = (episode_num - decay_end_episode) % 200
             if cycle_pos < 30:
                 epsilon = 0.05
-                agent.set_learning_rate(0.001)
+                # Spike LR ~5x base to amplify gradient on novel
+                # exploration transitions during the spike window.
+                agent.set_learning_rate(learning_rate * 5)
             else:
                 epsilon = epsilon_target
-                agent.set_learning_rate(0.0005)
+                agent.set_learning_rate(learning_rate)
 
         # Progress summary every 10 episodes
-        if (episode_num + 1) % 10 == 0:
+        if verbose and (episode_num + 1) % 10 == 0:
             avg = stats['total_score'] / stats['total_episodes']
             last_10 = (
                 sum(stats['scores'][-10:])
@@ -435,14 +498,15 @@ def train_agent(
             print(f"  High Score:       {stats['high_score']}")
             print(f"  Epsilon:          {epsilon:.3f}\n")
 
-    print(f"\n{'=' * 60}")
-    print("Training complete.")
-    print(f"  Total Episodes: {stats['total_episodes']}")
-    final_avg = stats['total_score'] / stats['total_episodes']
-    print(f"  Average Score:  {final_avg:.2f}")
-    print(f"  High Score:     {stats['high_score']}")
-    print(f"  Final Epsilon:  {epsilon:.3f}")
-    print(f"{'=' * 60}\n")
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print("Training complete.")
+        print(f"  Total Episodes: {stats['total_episodes']}")
+        final_avg = stats['total_score'] / stats['total_episodes']
+        print(f"  Average Score:  {final_avg:.2f}")
+        print(f"  High Score:     {stats['high_score']}")
+        print(f"  Final Epsilon:  {epsilon:.3f}")
+        print(f"{'=' * 60}\n")
 
     return agent, stats, epsilon
 
@@ -751,7 +815,55 @@ if __name__ == "__main__":
         help='Print detailed debug output for the first two training episodes',
     )
 
+    # --- Tunable hyperparameters (defaults match prior hardcoded values) ---
+    parser.add_argument(
+        '--learning-rate', type=float, default=0.000216,
+        help='Adam base learning rate (default: 0.000216, Optuna-tuned).',
+    )
+    parser.add_argument(
+        '--gamma', type=float, default=0.9646,
+        help='Discount factor for future rewards (default: 0.9646).',
+    )
+    parser.add_argument(
+        '--batch-size', type=int, default=512,
+        help='Mini-batch size for replay (default: 512).',
+    )
+    parser.add_argument(
+        '--no-eat-reward', type=float, default=None,
+        help=('Override Board.NO_EAT (default: -1.284, Optuna-tuned). '
+              'A larger negative value discourages aimless looping.'),
+    )
+    parser.add_argument(
+        '--hidden-layers', type=str, default=None,
+        help=('Comma-separated hidden-layer unit counts, e.g. "256,128,64". '
+              'Default: 448,320,64 (single) / 64,64 (multi).'),
+    )
+    parser.add_argument(
+        '--dropout', type=float, default=None,
+        help=('Dropout rate between hidden layers. '
+              'Default: 0.1 (single) / 0.0 (multi).'),
+    )
+
     args = parser.parse_args()
+
+    # Parse hidden_layers from "N,N,N" string into list of ints
+    parsed_hidden_layers = None
+    if args.hidden_layers:
+        try:
+            parsed_hidden_layers = [
+                int(x.strip()) for x in args.hidden_layers.split(',')
+                if x.strip()
+            ]
+            if not (2 <= len(parsed_hidden_layers) <= 4):
+                raise ValueError("must have 2-4 layers")
+        except ValueError as exc:
+            print(f"Error: --hidden-layers '{args.hidden_layers}': {exc}")
+            sys.exit(1)
+
+    # Build the rewards override dict if any reward flag was given
+    rewards_override = None
+    if args.no_eat_reward is not None:
+        rewards_override = {'NO_EAT': args.no_eat_reward}
 
     board_size = args.board_size
     training_mode = args.training_mode
@@ -804,7 +916,19 @@ if __name__ == "__main__":
         try:
             from tensorflow import keras as tf_keras
             agent.model = tf_keras.models.load_model(args.load)
-            agent.update_target_model()
+            # Rebuild target_model to match the loaded architecture.
+            # Necessary because older checkpoints may have a different
+            # network shape than the current default; without this clone
+            # `set_weights` would fail on architecture mismatch.
+            agent.target_model = tf_keras.models.clone_model(agent.model)
+            agent.target_model.set_weights(agent.model.get_weights())
+            # Sync the agent's hidden_layers attribute to reflect the
+            # actually-loaded architecture (not the constructor default).
+            agent.hidden_layers = [
+                layer.units
+                for layer in agent.model.layers
+                if hasattr(layer, 'units') and layer.units != agent.output_size
+            ]
             print(f"Model loaded: {args.load} (mode={loaded_mode})")
             if start_episode:
                 print(f"Resuming from episode {start_episode}")
@@ -847,6 +971,12 @@ if __name__ == "__main__":
             start_episode=start_episode,
             debug=args.debug,
             training_mode=training_mode,
+            learning_rate=args.learning_rate,
+            gamma=args.gamma,
+            batch_size=args.batch_size,
+            hidden_layers=parsed_hidden_layers,
+            dropout_rate=args.dropout,
+            rewards=rewards_override,
         )
 
         # Determine output path

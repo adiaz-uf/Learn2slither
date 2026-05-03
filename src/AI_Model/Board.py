@@ -9,11 +9,21 @@ import numpy as np
 
 from Snake import Snake
 
-# Reward constants.
+# Default reward constants. Per-instance overrides are accepted by
+# Board.__init__ via the `rewards` dict (used by Optuna tuning).
+# NO_EAT was tuned by Optuna (study snake-single-10) — the larger
+# negative value materially reduces aimless looping.
 INSTANT_GAMEOVER = -100
 GREEN_APPLE = 50
 RED_APPLE = -10
-NO_EAT = -0.3
+NO_EAT = -1.284
+
+DEFAULT_REWARDS = {
+    'INSTANT_GAMEOVER': INSTANT_GAMEOVER,
+    'GREEN_APPLE': GREEN_APPLE,
+    'RED_APPLE': RED_APPLE,
+    'NO_EAT': NO_EAT,
+}
 
 
 class Board:
@@ -28,11 +38,18 @@ class Board:
     (boardSize - 2) x (boardSize - 2).
     """
 
-    def __init__(self, board_size: int):
+    def __init__(self, board_size: int, rewards: dict = None):
         self.boardSize = board_size
         self.board = np.zeros((board_size, board_size), dtype=str)
         self.snake = Snake()
         self.food = []
+        # Per-instance reward values; module defaults apply when no
+        # override is supplied.
+        merged = {**DEFAULT_REWARDS, **(rewards or {})}
+        self.INSTANT_GAMEOVER = merged['INSTANT_GAMEOVER']
+        self.GREEN_APPLE = merged['GREEN_APPLE']
+        self.RED_APPLE = merged['RED_APPLE']
+        self.NO_EAT = merged['NO_EAT']
 
     def initialize(self):
         """Fill the board with walls, spawn the snake, and place food."""
@@ -170,8 +187,8 @@ class Board:
 
         Returns:
             (new_head_position, reward) on a valid move, or
-            (None, INSTANT_GAMEOVER) on collision — wall, self, or
-            zero-length after red apple.
+            (None, self.INSTANT_GAMEOVER) on collision — wall, self,
+            or zero-length after red apple.
         """
         old_hx = self.snake.head[0]
         old_hy = self.snake.head[1]
@@ -189,11 +206,11 @@ class Board:
 
         # Collision with wall
         if self.check_collision(new_head):
-            return None, INSTANT_GAMEOVER
+            return None, self.INSTANT_GAMEOVER
 
         # Collision with own body
         if new_head in self.snake.body:
-            return None, INSTANT_GAMEOVER
+            return None, self.INSTANT_GAMEOVER
 
         food_type = self.check_eat(new_head)
 
@@ -208,7 +225,7 @@ class Board:
         elif food_type == 'R':
             # Shrink: game over if the body is already empty
             if len(self.snake.body) == 0:
-                return None, INSTANT_GAMEOVER
+                return None, self.INSTANT_GAMEOVER
             # Remove the tail before inserting new body segment
             tail = self.snake.body.pop()
             self.board[tail[0]][tail[1]] = '0'
@@ -226,7 +243,7 @@ class Board:
         self.board[new_hx][new_hy] = 'H'
 
         if food_type == 'G':
-            return new_head, GREEN_APPLE
+            return new_head, self.GREEN_APPLE
         if food_type == 'R':
-            return new_head, RED_APPLE
-        return new_head, NO_EAT
+            return new_head, self.RED_APPLE
+        return new_head, self.NO_EAT

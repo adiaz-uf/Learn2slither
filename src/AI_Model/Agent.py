@@ -43,7 +43,10 @@ class Agent:
     """
 
     def __init__(self, board_size=None, mode='single',
-                 learning_rate=0.0005, gamma=0.98, debug=False):
+                 learning_rate=0.000216, gamma=0.9646, debug=False,
+                 batch_size=512, target_update_frequency=1000,
+                 memory_size=150000,
+                 hidden_layers=None, dropout_rate=None):
         if mode not in ('single', 'multi'):
             raise ValueError(
                 f"Unknown mode '{mode}'. Use 'single' or 'multi'."
@@ -64,6 +67,19 @@ class Agent:
             # 4 directions * 4 features (wall/body/green/red inverse distance)
             self.input_size = 16
 
+        # Network architecture defaults:
+        #   single — [448, 320, 64] from Optuna tuning (study snake-single-10).
+        #   multi  — [64, 64], unchanged (matches the 16-D feature input).
+        # Optuna tuning can still override both shape and dropout.
+        if hidden_layers is None:
+            hidden_layers = (
+                [448, 320, 64] if mode == 'single' else [64, 64]
+            )
+        if dropout_rate is None:
+            dropout_rate = 0.1 if mode == 'single' else 0.0
+        self.hidden_layers = list(hidden_layers)
+        self.dropout_rate = dropout_rate
+
         self.optimizer = optimizers.Adam(
             learning_rate=learning_rate, clipnorm=1.0
         )
@@ -76,13 +92,13 @@ class Agent:
         self.train_count = 0
 
         # Experience replay buffer.
-        # 150K capacity: at ~200 steps/episode the memory covers ~750 episodes,
-        # retaining useful experiences across the full exploitation phase.
-        self.memory = deque(maxlen=150000)
-        # Batch 512: lower gradient variance when Q-targets span a wide range.
-        # TensorFlow handles larger batches efficiently; the cost is minimal.
-        self.batch_size = 512
-        self.target_update_frequency = 1000  # steps between target syncs
+        # 150K default: at ~200 steps/episode covers ~750 episodes, retaining
+        # useful experiences across the full exploitation phase.
+        self.memory = deque(maxlen=memory_size)
+        # Batch 512 default: lower gradient variance when Q-targets span a
+        # wide range. TF handles larger batches efficiently.
+        self.batch_size = batch_size
+        self.target_update_frequency = target_update_frequency
 
         # Main network (trained every step) and target network (synced
         # periodically)
@@ -92,30 +108,26 @@ class Agent:
 
     def _build_model(self):
         """
-        Build and return the neural network.
+        Build and return the neural network from the configured
+        ``hidden_layers`` and ``dropout_rate``.
 
-        Architecture depends on mode:
-          - single: 512 -> 256 -> 128 -> 4 (large, rich one-hot input)
-          - multi : 64 -> 64 -> 4 (small, matches the 16-D compressed input)
+        Architecture is a stack of Dense(ReLU) layers, optionally with
+        Dropout in between (no dropout before the output). The last layer
+        is Dense(output_size, linear) producing one Q-value per action.
         """
-        if self.mode == 'single':
-            model = Sequential([
-                layers.Input(shape=(self.input_size,)),
-                layers.Dense(512, activation='relu'),
-                layers.Dropout(0.1),
-                layers.Dense(256, activation='relu'),
-                layers.Dropout(0.1),
-                layers.Dense(128, activation='relu'),
-                layers.Dense(self.output_size, activation='linear'),
-            ])
-        else:  # multi
-            model = Sequential([
-                layers.Input(shape=(self.input_size,)),
-                layers.Dense(64, activation='relu'),
-                layers.Dense(64, activation='relu'),
-                layers.Dense(self.output_size, activation='linear'),
-            ])
-        return model
+        layer_list = [layers.Input(shape=(self.input_size,))]
+        for i, units in enumerate(self.hidden_layers):
+            layer_list.append(layers.Dense(units, activation='relu'))
+            # Dropout between hidden layers, never before the output
+            if (
+                self.dropout_rate > 0
+                and i < len(self.hidden_layers) - 1
+            ):
+                layer_list.append(layers.Dropout(self.dropout_rate))
+        layer_list.append(
+            layers.Dense(self.output_size, activation='linear')
+        )
+        return Sequential(layer_list)
 
     def update_target_model(self):
         """Copy weights from the main model to the target model."""

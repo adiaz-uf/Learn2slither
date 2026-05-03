@@ -2,10 +2,14 @@ PYTHON  ?= python3
 VENV_PY := .venv/bin/python
 PIP     := .venv/bin/pip
 MAIN    := src/AI_Model/main.py
+TUNE    := src/AI_Model/tune.py
 
 SESSIONS ?= 100
 BOARD    ?= 10
 FPS      ?= 10
+# Optuna defaults
+TRIALS               ?= 50
+EPISODES_PER_TRIAL   ?= 1500
 # Training mode: 'single' (one model per board size, default) or
 # 'multi' (one portable model for 10/14/18 — bonus part).
 MODE     ?= single
@@ -24,7 +28,8 @@ SAVE     ?=
 	train-multi train-multi-debug train-multi-continue \
 	eval eval-visual eval-step \
 	eval-multi eval-multi-visual \
-	models models-10 models-14 models-18 models-multi
+	models models-10 models-14 models-18 models-multi \
+	tune tune-multi tune-fast tune-inspect tune-inspect-multi
 
 all: setup
 
@@ -59,8 +64,16 @@ help:
 	@echo "  make models-18                           -> generate models for 18x18 only"
 	@echo "  make models-multi                        -> generate 1/10/100-session multi models (bonus)"
 	@echo ""
+	@echo "  Hyperparameter tuning (Optuna):"
+	@echo "  make tune              BOARD=10 TRIALS=50 -> tune single mode (lr, gamma, batch, NO_EAT, layers)"
+	@echo "  make tune-multi        TRIALS=50          -> tune multi mode"
+	@echo "  make tune-fast         TRIALS=20          -> quick smoke test (500 ep / trial)"
+	@echo "  make tune-inspect       BOARD=10           -> show best params + importance + good zone"
+	@echo "  make tune-inspect-multi                    -> idem for multi study"
+	@echo ""
 	@echo "  Variables (current values):"
 	@echo "    SESSIONS=$(SESSIONS)  BOARD=$(BOARD)  FPS=$(FPS)  MODE=$(MODE)"
+	@echo "    TRIALS=$(TRIALS)  EPISODES_PER_TRIAL=$(EPISODES_PER_TRIAL)"
 	@echo "    MODEL=$(MODEL)"
 
 create-venv:
@@ -191,3 +204,36 @@ models-multi:
 		--save models/multi/snake_multi_100sess.keras
 
 models: models-10 models-14 models-18
+
+# ---------------------------------------------------------------------------
+# Hyperparameter tuning targets (Optuna)
+# Tunes: learning_rate (log 1e-4..2e-3), gamma (0.92..0.99),
+# batch_size {128,256,512,1024}, NO_EAT (-2..-0.1), and the network shape
+# (2-4 hidden layers, 64-512 units each).
+# Results: optuna_results/best_*.json + sqlite study in optuna_studies/.
+# ---------------------------------------------------------------------------
+
+tune:
+	$(VENV_PY) $(TUNE) --trials $(TRIALS) \
+		--episodes-per-trial $(EPISODES_PER_TRIAL) \
+		--training-mode single --board-size $(BOARD)
+
+tune-multi:
+	$(VENV_PY) $(TUNE) --trials $(TRIALS) \
+		--episodes-per-trial $(EPISODES_PER_TRIAL) \
+		--training-mode multi
+
+tune-fast:
+	$(VENV_PY) $(TUNE) --trials $(TRIALS) \
+		--episodes-per-trial 500 \
+		--training-mode single --board-size $(BOARD)
+
+# Inspect an existing Optuna study: best params, top-N trials, parameter
+# importance, and the median/range of high-value trials. Read-only.
+tune-inspect:
+	$(VENV_PY) src/AI_Model/inspect_study.py \
+		--training-mode single --board-size $(BOARD)
+
+tune-inspect-multi:
+	$(VENV_PY) src/AI_Model/inspect_study.py \
+		--training-mode multi
