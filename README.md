@@ -4,22 +4,22 @@ Agente de Snake entrenado con **Deep Q-Learning (DQN)** sobre TensorFlow/Keras.
 Este documento describe cómo funciona el algoritmo paso a paso y cómo lo
 implementa el código actual.
 
-El proyecto soporta **dos modos de entrenamiento**, seleccionables con la
-opción `--training-mode` de la CLI:
+El estado se codifica siempre como un **vector de 16 features de distancia
+tamaño-invariantes** (4 direcciones × `[d_wall, d_body, d_green, d_red]`,
+con cada `d` = `1/distancia`), de modo que la misma arquitectura de red
+juega en cualquier tamaño de tablero.
 
-- **`single`** (por defecto): un modelo dedicado a un único `--board-size`
-  (10, 14 o 18). Codifica el estado con un **one-hot completo** del brazo
-  visible — input grande pero atado a un tamaño concreto. Es la versión que
-  mejor rinde en 10×10.
-- **`multi`** (bonus de portabilidad): un solo modelo válido para los **tres
-  tamaños 10/14/18**. Codifica el estado con **features de distancia
-  tamaño-invariantes** (16 floats) y, durante el entrenamiento, cada episodio
-  samplea un tamaño desde `[10, 14, 18]` con pesos `[0.7, 0.15, 0.15]`.
+El proyecto ofrece **dos modos de entrenamiento**, seleccionables con la
+opción `--training-mode` de la CLI. Sólo se diferencian en el **muestreo de
+tamaños del tablero** durante el entrenamiento; la red, el encoder y los
+hiperparámetros son idénticos:
 
-Las dos rutas comparten el mismo algoritmo (DQN + experience replay + target
-network + Double DQN) y la misma función de recompensa. **Lo único que cambia
-es la codificación del estado y la geometría de la red**. Cada vez que los dos
-modos divergen lo señalamos explícitamente.
+- **`single`** (por defecto): cada episodio se juega en `--board-size`
+  (10, 14 o 18). Modelo especialista en un tamaño concreto.
+- **`multi`** (bonus de portabilidad): cada episodio samplea uniformemente
+  uno de `[10, 14, 18]` (33% / 33% / 33%). Un único modelo entrenado
+  expuesto a los tres tamaños — cubre el bonus del subject de jugar
+  cualquier tamaño con un único modelo.
 
 > Para uso e instalación, ver [USAGE.md](USAGE.md).
 
@@ -32,7 +32,7 @@ El código se organiza en cinco archivos:
 | Archivo                                          | Responsabilidad                                                                              |
 |--------------------------------------------------|----------------------------------------------------------------------------------------------|
 | [src/AI_Model/main.py](src/AI_Model/main.py)     | CLI, bucle de entrenamiento/evaluación, sampling de tamaños en `multi`, checkpoints, carga de modelos. |
-| [src/AI_Model/Agent.py](src/AI_Model/Agent.py)   | DQN: arquitectura de la red, replay buffer, target network, `process_view` con dispatch single/multi. |
+| [src/AI_Model/Agent.py](src/AI_Model/Agent.py)   | DQN: arquitectura de la red, replay buffer, target network, encoder 16-D `process_view`. |
 | [src/AI_Model/Board.py](src/AI_Model/Board.py)   | Lógica del juego, generación de visión cruz, recompensas, colisiones.                        |
 | [src/AI_Model/Snake.py](src/AI_Model/Snake.py)   | Estructura de datos del snake (cabeza + cuerpo).                                              |
 | [src/UI/game_ui.py](src/UI/game_ui.py)           | Visualización pygame: lobby con selector de tamaños, tablero, game-over, stats.              |
@@ -52,12 +52,12 @@ El target que persigue la red es:
 Q*(s,a) = r + γ · max_a' Q*(s',a')
 ```
 
-con `γ = 0.98` ([Agent.py:56](src/AI_Model/Agent.py#L56)).
+con `γ = 0.9646` (Optuna-tuned, [Agent.py](src/AI_Model/Agent.py)).
 
 Las dos secciones siguientes explican los **dos pilares conceptuales** del
 algoritmo: la **Q-function** (qué queremos calcular) y la **red neuronal**
-(con qué la calculamos). En la sección 4 vemos cómo cambia la entrada según
-el modo.
+(con qué la calculamos). En la sección 4 detallamos el encoder 16-D que
+alimenta la red.
 
 ---
 
@@ -94,8 +94,9 @@ Q(s, a) = E[ r₀ + γ·r₁ + γ²·r₂ + γ³·r₃ + ... ]
               recompensa de ejecutar a ahora
 ```
 
-`γ = 0.98` es el discount factor: las recompensas lejanas valen menos que las
-inmediatas. El agente prefiere una manzana ahora a una manzana en 100 pasos.
+`γ = 0.9646` es el discount factor: las recompensas lejanas valen menos que
+las inmediatas. El agente prefiere una manzana ahora a una manzana en 100
+pasos.
 
 ### 2.3 ¿Para qué sirve la Q-function?
 
@@ -106,15 +107,15 @@ Esto es exactamente lo que hace
 [Agent.get_action()](src/AI_Model/Agent.py#L221) cuando no está explorando:
 
 ```python
-state = self.process_view(view, self.board_size)        # codifica el estado
-q_values = self.model(state, training=False)            # forward pass
-return int(np.argmax(q_values[0]))                      # elige la acción
-                                                        # de mayor Q-value
+state = self.process_view(view)                  # codifica el estado a 16-D
+q_values = self.model(state, training=False)     # forward pass
+return int(np.argmax(q_values[0]))               # elige la acción
+                                                 # de mayor Q-value
 ```
 
-**La política óptima sale gratis** una vez tienes una buena Q-function — y
-eso vale por igual para `single` y `multi`: ambos modos producen un vector
-de 4 Q-values en la salida.
+**La política óptima sale gratis** una vez tienes una buena Q-function. Como
+la red emite un vector de 4 Q-values, sólo necesitamos un `argmax` para
+decidir.
 
 ### 2.4 La ecuación de Bellman — cómo se aprende Q
 
@@ -138,12 +139,10 @@ replay buffer y, más tarde, sirve para construir un target.
 
 ### 2.5 ¿Por qué necesitamos aproximarla con una red neuronal?
 
-En problemas pequeños, `Q` cabe en una **Q-table**. Aquí no:
-
-- En modo `single` con visión cruz one-hot 240D (10×10) hay hasta `2²⁴⁰ ≈
-  10⁷²` estados posibles.
-- En modo `multi` el estado es un vector continuo de 16 floats — tampoco
-  tabulable.
+En problemas pequeños, `Q` cabe en una **Q-table**. Aquí no: el estado es un
+vector continuo de 16 floats (4 direcciones × 4 distancias normalizadas en
+`[0, 1]`). El cardinal del espacio de estados es infinito — imposible de
+tabular.
 
 Aproximamos `Q(s, a)` con una **función paramétrica** `Q(s, a; θ)` que
 generaliza entre estados parecidos. Esa función paramétrica es la red
@@ -155,16 +154,11 @@ neuronal.
 
 ### 3.1 ¿Qué hace exactamente la red en este proyecto?
 
-Aproxima la Q-function. La forma del input cambia según el modo, pero la
-salida es siempre la misma:
+Aproxima la Q-function:
 
 ```
-Modo single:  Entrada = vector one-hot de 4·N·6 floats
-              (con N = board_size, 240 floats para 10×10)
-Modo multi:   Entrada = vector de 16 floats (4 dirs × 4 features 1/d)
-
-En ambos:     Salida   = vector de 4 floats
-                       = [Q(s,UP), Q(s,DOWN), Q(s,LEFT), Q(s,RIGHT)]
+Entrada:  vector de 16 floats (4 dirs × [d_wall, d_body, d_green, d_red])
+Salida:   vector de 4 floats = [Q(s,UP), Q(s,DOWN), Q(s,LEFT), Q(s,RIGHT)]
 ```
 
 **Una sola pasada hacia delante** (forward pass) nos da los Q-values de las
@@ -172,34 +166,9 @@ cuatro acciones a la vez.
 
 ### 3.2 Arquitectura — capa por capa
 
-Definida en [Agent._build_model()](src/AI_Model/Agent.py#L93). El método
-ramifica según `self.mode`:
-
-#### Modo `single` — red grande para input rico
-
-```
-Input(4 · board_size · 6)        ← 240 para 10×10 (336 para 14, 432 para 18)
-    │
-    ▼
-Dense(512, ReLU)
-    │
-Dropout(0.1)
-    │
-    ▼
-Dense(256, ReLU)
-    │
-Dropout(0.1)
-    │
-    ▼
-Dense(128, ReLU)
-    │
-    ▼
-Dense(4, lineal)
-                                  ─────────────────
-                                  ≈ 288 132 parámetros (10×10)
-```
-
-#### Modo `multi` — red compacta para input ya comprimido
+Definida en [Agent._build_model()](src/AI_Model/Agent.py). El default es un
+MLP compacto adecuado al input 16-D (Optuna tuning puede sobrescribir
+forma y dropout):
 
 ```
 Input(16)
@@ -216,19 +185,13 @@ Dense(4, lineal)
                                   ≈ 5 444 parámetros
 ```
 
-#### Por qué la diferencia de tamaño
+#### Por qué tan pequeña
 
-| Aspecto                  | `single`                                | `multi`                                       |
-|--------------------------|-----------------------------------------|-----------------------------------------------|
-| Dimensión del input      | 240 / 336 / 432 según `board_size`       | 16 (fijo)                                     |
-| Información por feature  | Indicador binario de categoría por celda | Distancia normalizada por entidad y dirección |
-| Capacidad necesaria      | Alta — la red debe aprender a leer un one-hot disperso | Baja — las features ya son interpretables |
-| Riesgo de overfitting    | Alto → dropout y red ancha               | Bajo → red estrecha sin dropout               |
-
-El modo `multi` puede permitirse una red mucho más pequeña porque el input ya
-contiene información destilada (¿a qué distancia hay pared? ¿a qué distancia
-hay manzana?). En `single` la red tiene que aprender a leer el one-hot — una
-tarea más cruda que requiere más capacidad.
+El input ya contiene la información destilada (¿a qué distancia hay pared?
+¿a qué distancia hay manzana?). La red no necesita inferir relaciones
+posicionales a partir de un one-hot crudo — basta con combinar 16 distancias.
+Pocas neuronas, pocos parámetros, generalización rápida y poco riesgo de
+overfitting.
 
 ### 3.3 Por qué cada elección de diseño
 
@@ -245,13 +208,12 @@ Una sigmoid o softmax los distorsionaría. Aunque la salida tenga 4 neuronas
 **esto no es clasificación**: son cuatro escalares de regresión (uno por
 acción), por eso la loss es Huber y no cross-entropy.
 
-#### Dropout 0.1 sólo en `single`
+#### Dropout off por defecto
 
-Apaga aleatoriamente el 10% de activaciones en las dos primeras capas durante
-training, sólo en `single`. La red `multi` (~5 K parámetros) es demasiado
-pequeña para necesitarlo: añadir dropout reduciría su capacidad por debajo de
-lo útil. Sólo se aplica en training, no en evaluación
-([get_action](src/AI_Model/Agent.py#L221) usa `training=False`).
+La red default de ~5 K parámetros es lo suficientemente pequeña como para no
+necesitar dropout — añadirlo reduciría la capacidad útil por debajo del
+mínimo. Optuna puede activarlo si encuentra una arquitectura más grande
+donde compense.
 
 #### Huber loss (δ = 1.0)
 
@@ -261,13 +223,11 @@ lo útil. Sólo se aplica en training, no en evaluación
 con MSE, errores de magnitud 250 producirían gradientes proporcionales a
 62500 → desestabilizan la red.
 
-#### Adam con `lr = 0.0005` y `clipnorm = 1.0`
-
-[Agent.py:67-69](src/AI_Model/Agent.py#L67):
+#### Adam con `lr = 0.000216` y `clipnorm = 1.0`
 
 - **Adam**: combina momentum y learning rate adaptativo por parámetro.
-- **Learning rate 0.0005**: bajo a propósito; RL es propenso a olvido
-  catastrófico.
+- **Learning rate 0.000216** (Optuna-tuned): bajo a propósito; RL es propenso
+  a olvido catastrófico.
 - **clipnorm = 1.0**: si la norma del gradiente excede 1, se reescala. Red de
   seguridad complementaria a Huber.
 
@@ -303,56 +263,18 @@ El agente **no ve el tablero completo**. Recibe sólo cuatro líneas de visión
 (arriba, abajo, izquierda, derecha) que parten de la cabeza, hasta encontrar
 una pared.
 
-[Board.get_snake_view()](src/AI_Model/Board.py#L121) devuelve cuatro listas
+[Board.get_snake_view()](src/AI_Model/Board.py) devuelve cuatro listas
 ordenadas de la celda más cercana a la más lejana. Cada celda contiene uno
-de seis caracteres:
+de los caracteres `0` (vacío), `W` (pared), `S` (cuerpo), `G` (manzana
+verde) o `R` (manzana roja).
 
-| Char | Significado     | Índice one-hot |
-|------|------------------|----------------|
-| `0`  | Celda vacía      | 0              |
-| `W`  | Pared            | 1              |
-| `S`  | Cuerpo serpiente | 2              |
-| `G`  | Manzana verde    | 3              |
-| `R`  | Manzana roja     | 4              |
-| `H`  | Cabeza           | 5              |
+[Agent.process_view()](src/AI_Model/Agent.py) **convierte la visión cruda
+en un tensor de 16 floats** que alimenta a la red.
 
-La salida de `get_snake_view()` es **idéntica para los dos modos**. La
-diferencia está en el siguiente paso:
-[Agent.process_view()](src/AI_Model/Agent.py#L134) **convierte la visión en
-un tensor para la red** y ramifica según `self.mode`:
+### 4.1 Encoder 16-D — features tamaño-invariantes
 
-```python
-def process_view(self, view, board_size=None):
-    if self.mode == 'multi':
-        return self._process_view_features(view)
-    return self._process_view_onehot(view, board_size or self.board_size)
-```
-
-### 4.1 Modo `single` — one-hot completo (240D para 10×10)
-
-[Agent._process_view_onehot()](src/AI_Model/Agent.py#L149):
-
-- Cada brazo se rellena hasta `board_size` celdas. Si el brazo no contiene
-  pared, se inserta una **pared virtual** en la última posición — así la red
-  siempre percibe un límite y el tamaño del input es fijo.
-- Cada celda se codifica como un vector one-hot de 6 categorías
-  (`CHAR_MAP` en [Agent.py:24](src/AI_Model/Agent.py#L24)).
-- Resultado final: `4 brazos × board_size celdas × 6 categorías` valores.
-- Para `board_size = 10` → **240 dimensiones** (336 para 14, 432 para 18).
-
-> ¿Por qué one-hot y no enteros? Los enteros impondrían un orden ficticio
-> (`G=3` "más cerca de" `R=4` que de `0`), sesgando el aprendizaje. One-hot
-> trata cada categoría como independiente.
-
-**Ventaja**: la red ve la posición exacta de cada elemento del brazo.
-**Coste**: el input está ligado al `board_size`; cambiar el tamaño cambia la
-arquitectura. **No portable.**
-
-### 4.2 Modo `multi` — features tamaño-invariantes (16D)
-
-[Agent._process_view_features()](src/AI_Model/Agent.py#L185) genera un vector
-de **16 dimensiones que NO depende del tamaño del tablero**, condición
-necesaria para el bonus de portabilidad.
+[Agent._process_view_features()](src/AI_Model/Agent.py) genera un vector de
+**16 dimensiones que NO depende del tamaño del tablero**.
 
 Para cada una de las 4 direcciones emite 4 números:
 
@@ -369,33 +291,22 @@ en el brazo:
 
 Total: `4 direcciones × 4 entidades = 16 features`.
 
-#### Por qué `1/distancia` y no `distancia` cruda
+### 4.2 Por qué `1/distancia` y no `distancia` cruda
 
-1. **Acota el rango** a `[0, 1]` independientemente de `board_size`.
+1. **Acota el rango** a `[0, 1]` independientemente del tamaño de tablero.
 2. **Da más peso a lo cercano** — la diferencia entre "pared a 1" y "pared a
    2" (1.0 → 0.5) es enorme; entre "pared a 9" y "pared a 10" (0.111 →
    0.100) es despreciable. Refleja la urgencia táctica.
 3. **`0.0` representa naturalmente "no visible"**.
 
-#### Trade-off frente a `single`
+### 4.3 Implicaciones del encoder
 
-| Ventaja                                         | Coste                                                    |
-|-------------------------------------------------|----------------------------------------------------------|
-| Mismo input shape para 10/14/18                 | Pierde información posicional fina                       |
-| Una sola red sirve para todos los tamaños       | Menos capacidad → red más pequeña                        |
-| Generaliza por composición de distancias        | Convergencia algo más lenta en 10×10 que `single`        |
-| Robusto frente a tableros nuevos (interpolación) | No distingue varias manzanas en el mismo brazo (sólo la más cercana) |
-
-### 4.3 Comparación lado a lado
-
-| Aspecto                  | `single`                                       | `multi`                              |
-|--------------------------|------------------------------------------------|--------------------------------------|
-| Input shape              | `(1, 4·N·6)` con N = board_size                | `(1, 16)` siempre                    |
-| Información              | Tipo de cada celda visible                     | Distancia a la primera de cada tipo  |
-| Granularidad             | Por celda                                      | Por dirección                        |
-| Tableros entrenables     | Uno fijo                                       | Cualquiera (10/14/18 vistos en el sampling) |
-| Tableros jugables tras entrenar | Sólo el entrenado                       | Los tres                             |
-| Codificador              | [Agent.py:149](src/AI_Model/Agent.py#L149)     | [Agent.py:185](src/AI_Model/Agent.py#L185) |
+| Propiedad                                       | Consecuencia                                          |
+|-------------------------------------------------|-------------------------------------------------------|
+| Input shape fijo (16) en cualquier tamaño       | La misma red juega 10/14/18 — cubre el bonus          |
+| Inductive bias en `1/d`                         | Lo cercano pesa más automáticamente                   |
+| Solo distancia a la primera entidad por brazo   | No distingue "varias manzanas en línea" (limitación)  |
+| Sin información posicional absoluta             | La política aprende relaciones, no posiciones         |
 
 ---
 
@@ -422,12 +333,13 @@ Constantes en [Board.py:13-16](src/AI_Model/Board.py#L13):
 |--------------------------|-----------------------|---------------------|------------------------------------|
 | Manzana verde            | `+50`                 | `GREEN_APPLE`       | Señal positiva fuerte              |
 | Manzana roja             | `-10`                 | `RED_APPLE`         | Penalización moderada (encoge)     |
-| Movimiento sin comer     | `-0.3`                | `NO_EAT`            | Urgencia por buscar comida         |
+| Movimiento sin comer     | `-1.284`              | `NO_EAT`            | Urgencia por buscar comida         |
 | Colisión / loop / suicidio (red apple en cuerpo vacío) | `-100` | `INSTANT_GAMEOVER` | Señal de muerte fuerte             |
 | Timeout `max_steps`      | `-50`                 | (literal en main.py) | Episodio demasiado largo           |
 
-La función de recompensa es **idéntica para los dos modos**. El snake percibe
-los mismos estímulos sin importar cómo se codifique su visión.
+La función de recompensa es **idéntica para los dos modos** — la única
+diferencia entre `single` y `multi` está en el muestreo de tamaños de
+tablero, no en cómo se interpretan eventos.
 
 ### Detección de loops — escala con la longitud
 
@@ -464,12 +376,12 @@ pasos para esquivar su propio cuerpo.
 
 ## 7. Política ε-greedy
 
-[Agent.get_action()](src/AI_Model/Agent.py#L221):
+[Agent.get_action()](src/AI_Model/Agent.py):
 
 ```python
 if np.random.rand() < epsilon:
     return np.random.randint(0, self.output_size)   # exploración
-state = self.process_view(view, self.board_size)
+state = self.process_view(view)
 q_values = self.model(state, training=False)
 return int(np.argmax(q_values[0]))                  # explotación
 ```
@@ -492,8 +404,8 @@ epsilon_target = 0.01
    (ej. 20 K episodios) no se pasen mucho tiempo en pura exploración.
 3. **Explotación con ciclos**: a partir de `decay_end_episode`, en bloques de
    200 episodios, los **primeros 30** suben a `ε = 0.05` **y** elevan el
-   learning rate a `0.001`; los siguientes 170 vuelven a `ε = 0.01` y
-   `lr = 0.0005`. El spike de lr permite que las transiciones nuevas
+   learning rate a `5 × lr_base`; los siguientes 170 vuelven a `ε = 0.01` y
+   `lr = lr_base`. El spike de lr permite que las transiciones nuevas
    obtenidas mediante exploración tengan suficiente peso sobre los 150 K de
    buffer mayoritariamente greedy.
 
@@ -533,17 +445,13 @@ para no olvidar lo aprendido en el warmup cuando el agente entra en
 explotación.
 
 > En el modo `multi`, el buffer mezcla transiciones de los tres tamaños
-> (sampleados con peso 70/15/15 por episodio). Cada mini-batch tiene una
+> (sampleadas uniformemente por episodio). Cada mini-batch tiene una
 > distribución representativa, lo que **fuerza a la red a aprender una
-> política que funcione en los tres tableros simultáneamente** en lugar de
-> especializarse en uno.
+> política que funcione en los tres tableros simultáneamente**.
 
-> Importante: en el buffer se guardan **vistas crudas** (las listas de chars
-> que devuelve `Board.get_snake_view()`), no los tensores codificados. La
-> codificación se aplica al sacar las muestras del buffer (paso 5b en la
-> sección 11). Esto reduce 4× la memoria del buffer en `single` y permite
-> que `multi` mezcle transiciones de los tres tamaños sin problemas de
-> compatibilidad.
+> En el buffer se guardan **vistas crudas** (las listas de chars que
+> devuelve `Board.get_snake_view()`), no los tensores codificados. La
+> codificación se aplica al sacar las muestras del buffer.
 
 ---
 
@@ -642,9 +550,8 @@ agente.
 action_idx = agent.get_action(current_view, epsilon)
 ```
 
-Internamente `get_action` llama a `process_view`, que dispatcha en función de
-`self.mode` (single → 240D, multi → 16D), hace un forward pass y devuelve el
-`argmax`.
+Internamente `get_action` llama a `process_view` para obtener el tensor 16-D,
+hace un forward pass y devuelve el `argmax`.
 
 ### 10.4 Paso 3 — ejecutar la acción
 
@@ -707,14 +614,13 @@ sólo llenan el buffer). Después, sample uniforme.
 ```python
 states, next_states, actions, rewards, dones = [], [], [], [], []
 for sv, a, r, nsv, d in minibatch:
-    states.append(self.process_view(sv, self.board_size)[0])
-    next_states.append(self.process_view(nsv, self.board_size)[0])
+    states.append(self.process_view(sv)[0])
+    next_states.append(self.process_view(nsv)[0])
     actions.append(a); rewards.append(r); dones.append(d)
 ```
 
-→ Aplica el encoding (one-hot en `single`, features `1/d` en `multi`) a cada
-visión y construye arrays NumPy. **Esta es la única línea del flujo donde el
-modo afecta a las dimensiones del tensor.**
+→ Aplica el encoder 16-D `1/distancia` a cada visión y construye arrays
+NumPy listos para alimentar a la red.
 
 #### 6c — Construir el target de Bellman (Double DQN + target network)
 
@@ -761,7 +667,7 @@ if self.train_count % self.target_update_frequency == 0:
 | 4  | Chequeo done                      | [main.py:256-285](src/AI_Model/main.py#L256)                   | Terminación de episodio                         |
 | 5  | Guardar transición                | [Agent.py:235](src/AI_Model/Agent.py#L235)                     | Experience Replay (escritura)                   |
 | 6a | Sample aleatorio del buffer       | [Agent.py:262-265](src/AI_Model/Agent.py#L262)                 | Experience Replay (lectura)                     |
-| 6b | Encoding del batch                | [Agent.py:267-279](src/AI_Model/Agent.py#L267)                 | **single u multi (`process_view`)**             |
+| 6b | Encoding del batch                | [Agent.py](src/AI_Model/Agent.py) `process_view`               | Encoder 16-D                                    |
 | 6c | Target de Bellman                 | [Agent.py:289-295](src/AI_Model/Agent.py#L289)                 | Bellman + Target net + Double DQN               |
 | 6d | Forward + Huber + backprop + Adam | [Agent.py:239-251](src/AI_Model/Agent.py#L239)                 | **Update de los pesos `θ`**                     |
 | 6e | Sync target network               | [Agent.py:301-307](src/AI_Model/Agent.py#L301)                 | Target network update                           |
@@ -802,17 +708,11 @@ metadata.
 │                                                                 │
 │  Paso 1  ←  Estado          (visión cruz, lista de chars)       │
 │  Paso 2  ←  ε-greedy        (process_view → red predictiva)     │
-│             ↑                                                   │
-│             └─ AQUÍ se aplica single/multi: dispatch en Agent   │
-│                                                                 │
 │  Paso 3  ←  Recompensa r    (creada por el entorno)             │
 │  Paso 4  ←  Detección de done (collision / loop / timeout)      │
 │  Paso 5  ←  Replay buffer   (vistas crudas, no tensores)        │
 │  Paso 6a ←  Replay buffer   (sampling aleatorio)                │
-│  Paso 6b ←  process_view sobre el batch                         │
-│             ↑                                                   │
-│             └─ y AQUÍ — última divergencia entre los dos modos  │
-│                                                                 │
+│  Paso 6b ←  process_view sobre el batch (encoder 16-D)          │
 │  Paso 6c ←  Bellman + Target network + Double DQN               │
 │            (← AQUÍ las recompensas se transforman en targets)   │
 │  Paso 6d ←  Backprop + Huber + Adam                             │
@@ -879,63 +779,221 @@ python src/AI_Model/main.py --dontlearn --visual on \
 
 ## 12. CLI completa
 
-Definida en [main.py:698-751](src/AI_Model/main.py#L698):
+Definida en [main.py](src/AI_Model/main.py):
 
-| Argumento          | Default | Descripción                                                       |
-|--------------------|---------|-------------------------------------------------------------------|
-| `--sessions`       | `100`   | Episodios de entrenamiento o partidas de evaluación.              |
-| `--load`           | `None`  | Path a `.keras` para cargar (lee `*_metadata.json` si existe).    |
-| `--save`           | `None`  | Path para el modelo final; si se omite se autogenera con timestamp. |
-| `--dontlearn`      | `False` | Modo evaluación (no llama a `replay()`).                          |
-| `--visual`         | `off`   | `on` activa la UI pygame (lobby + tablero).                       |
-| `--step-by-step`   | `False` | Pausa cada paso (sólo evaluación).                                |
-| `--board-size`     | `10`    | Choices `[10, 14, 18]`. En `multi`: sólo display fallback.         |
-| `--training-mode`  | `single` | Choices `single` / `multi` (sección 13).                         |
-| `--fps`            | `10`    | FPS de la visualización pygame.                                   |
-| `--debug`          | `False` | Output detallado en los 2 primeros episodios.                     |
+| Argumento            | Default      | Descripción                                                       |
+|----------------------|--------------|-------------------------------------------------------------------|
+| `--sessions`         | `100`        | Episodios de entrenamiento o partidas de evaluación.              |
+| `--load`             | `None`       | Path a `.keras` para cargar (lee `*_metadata.json` si existe).    |
+| `--save`             | `None`       | Path para el modelo final; si se omite se autogenera con timestamp. |
+| `--dontlearn`        | `False`      | Modo evaluación (no llama a `replay()`).                          |
+| `--visual`           | `off`        | `on` activa la UI pygame (lobby + tablero).                       |
+| `--step-by-step`     | `False`      | Pausa cada paso (sólo evaluación).                                |
+| `--board-size`       | `10`         | Choices `[10, 14, 18]`. En `multi`: sólo display fallback.        |
+| `--training-mode`    | `single`     | Choices `single` / `multi`.                                       |
+| `--fps`              | `10`         | FPS de la visualización pygame.                                   |
+| `--debug`            | `False`      | Output detallado en los 2 primeros episodios.                     |
+| `--learning-rate`    | `0.000216`   | Adam base learning rate.                                          |
+| `--gamma`            | `0.9646`     | Discount factor.                                                  |
+| `--batch-size`       | `512`        | Mini-batch del replay buffer.                                     |
+| `--no-eat-reward`    | `None`       | Override de `Board.NO_EAT` (default `-1.284`).                    |
+| `--hidden-layers`    | `None`       | Capas ocultas, e.g. `"64,64"` o `"256,128,64"`. Default: `64,64`. |
+| `--dropout`          | `None`       | Dropout entre capas ocultas. Default: `0.0`.                      |
 
-### 12.1 Entrenamiento desde cero
+> Modelos guardados con el encoder one-hot legacy (`input_shape != 16`) se
+> rechazan al cargar con un mensaje de error claro — hay que reentrenar.
+
+---
+
+## 12bis. Cookbook — comandos para todo
+
+> Todos los comandos asumen el venv ya creado (`make setup`). Las
+> alternativas con `python …` son equivalentes a las recetas con `make`
+> pero permiten flags fuera del Makefile.
+
+### 12bis.1 Setup inicial
 
 ```bash
-# single, 10×10
-python src/AI_Model/main.py --sessions 10000 --board-size 10
-# (--training-mode single es el default)
-
-# multi (un modelo para 10/14/18)
-python src/AI_Model/main.py --sessions 10000 --training-mode multi
+make setup        # crea .venv y pip install -r requirements.txt
 ```
 
-### 12.2 Continuar entrenamiento desde un checkpoint
+### 12bis.2 Entrenamiento — single mode (especialista en un tamaño)
 
 ```bash
-python src/AI_Model/main.py --sessions 5000 \
-    --load models/10x10/best_snake_10x10_9000ep.keras
+# 10K episodios en 10×10, sin visualización
+make train SESSIONS=10000 BOARD=10
+
+# Idem 14×14 y 18×18
+make train SESSIONS=10000 BOARD=14
+make train SESSIONS=10000 BOARD=18
+
+# Con UI pygame (mucho más lento, sólo para inspección visual)
+make train-visual SESSIONS=200 BOARD=10 FPS=30
+
+# Debug verbose en los 2 primeros episodios
+make train-debug SESSIONS=50 BOARD=10
+
+# Continuar entrenamiento desde un checkpoint
+make train-continue SESSIONS=5000 BOARD=10 \
+    MODEL=models/10x10/best_avg_snake_10x10_10000ep.keras
+
+# Con hiperparámetros custom (sobreescribe los defaults Optuna-tuned)
+python src/AI_Model/main.py --sessions 10000 --board-size 10 \
+    --learning-rate 0.0005 --gamma 0.97 --hidden-layers 128,64
 ```
 
-[main.py:761-812](src/AI_Model/main.py#L761) lee `*_metadata.json` para
-recuperar `mode`, `board_size`, `total_episodes`. Si el modelo cargado tiene
-`mode='single'` con un `board_size` distinto al CLI, **el modelo gana** y se
-sobreescribe `--board-size`. Si el `mode` cargado no coincide con
-`--training-mode`, gana también el del modelo (las arquitecturas son
-incompatibles).
-
-> Modelos antiguos sin `*_metadata.json` se asumen `mode='single'` con el
-> `--board-size` actual de la CLI (compatibilidad hacia atrás).
-
-### 12.3 Evaluación
+### 12bis.3 Entrenamiento — multi mode (33/33/33, bonus)
 
 ```bash
-# Sin UI (terminal)
-python src/AI_Model/main.py --dontlearn --sessions 10 \
-    --load models/multi/best_snake_multi_10000ep.keras
+# 10K episodios sampleando uniformemente 10/14/18
+make train-multi SESSIONS=10000
 
-# Con UI (selector + tablero)
-python src/AI_Model/main.py --dontlearn --visual on \
-    --load models/multi/best_snake_multi_10000ep.keras
+# Con debug
+make train-multi-debug SESSIONS=50
 
-# Paso a paso (Enter / tecla entre pasos)
+# Continuar multi desde un checkpoint
+make train-multi-continue SESSIONS=5000 \
+    MODEL=models/multi/best_avg_snake_multi_10000ep.keras
+```
+
+### 12bis.4 Evaluación
+
+```bash
+# Terminal: 30 partidas en 10×10 (default board)
+make eval SESSIONS=30 BOARD=10 \
+    MODEL=models/10x10/best_avg_snake_10x10_10000ep.keras
+
+# UI pygame: lobby con selector de tamaño + tablero animado
+make eval-visual BOARD=10 \
+    MODEL=models/10x10/best_avg_snake_10x10_10000ep.keras
+
+# UI con selector de los 3 tamaños (modelo multi)
+make eval-multi-visual \
+    MODEL=models/multi/best_avg_snake_multi_10000ep.keras
+
+# Step-by-step en terminal (Enter entre pasos)
+make eval-step BOARD=10 \
+    MODEL=models/10x10/best_avg_snake_10x10_10000ep.keras
+
+# Step-by-step con UI (cualquier tecla entre pasos)
 python src/AI_Model/main.py --dontlearn --visual on --step-by-step \
-    --load models/10x10/best_snake_10x10_9000ep.keras
+    --load models/multi/best_avg_snake_multi_10000ep.keras
+```
+
+### 12bis.5 Modelos requirement del subject (1, 10, 100 sessions)
+
+```bash
+# Genera 1, 10, 100 sessions en /models/<size>x<size>/ para los 3 tamaños
+make models             # = models-10 + models-14 + models-18
+
+# Sólo un tamaño concreto
+make models-10
+make models-14
+make models-18
+
+# Modelo multi-size correspondiente (bonus)
+make models-multi
+```
+
+### 12bis.6 Optuna — fine-tuning de hiperparámetros
+
+**Importante**: single y multi se tunean **por separado** (las tareas son
+distintas, los óptimos pueden divergir). Cada modo guarda en su propio
+study SQLite.
+
+```bash
+# Single 10×10 — recomendado para el modelo "especialista"
+make tune TRIALS=30 BOARD=10
+# (= 30 trials × 5000 ep, study: snake-single-10)
+
+# Single 14×14 / 18×18
+make tune TRIALS=30 BOARD=14
+make tune TRIALS=30 BOARD=18
+
+# Multi (33/33/33) — para el bonus
+make tune-multi TRIALS=30
+# (study: snake-multi)
+
+# Smoke test rápido (5-10 min, 500 ep/trial, sin pruning)
+make tune-fast TRIALS=10 BOARD=10
+```
+
+**Inspección de resultados** (cuando termine, o en paralelo desde otra
+terminal mientras corre — es sólo lectura):
+
+```bash
+# Best params + parameter importance + good zone + comando ready-to-paste
+make tune-inspect BOARD=10
+make tune-inspect-multi
+```
+
+**Continuar/extender un study existente**: simplemente vuelve a lanzar
+`make tune` con el mismo board/mode. Optuna detecta el SQLite y añade los
+nuevos trials encima:
+
+```bash
+# Tienes 12 trials de un tune anterior y quieres 20 más:
+make tune TRIALS=20 BOARD=10
+# Ahora hay 32 trials en el study; TPE usa los 12 anteriores como contexto.
+```
+
+**Controlar el pruning** (lenient por default — ver sección 14.2):
+
+```bash
+# Sin pruning ninguno (max safety)
+make tune TRIALS=30 BOARD=10 PRUNER=none
+
+# Pruning agresivo (Median, sin patience) — ahorra más tiempo, riesgo mayor
+make tune TRIALS=30 BOARD=10 PRUNER=median PATIENCE=0
+
+# Más conservador todavía (mata sólo el bottom-10%)
+make tune TRIALS=30 BOARD=10 PRUNE_PCT=10
+
+# Pruning desde más tarde (no juzgar antes del episodio 2500)
+make tune TRIALS=30 BOARD=10 N_WARMUP_STEPS=2500
+```
+
+**Entrenar el modelo final con los hiperparámetros ganadores**: al final
+de `tune-inspect` aparece un comando ready-to-paste. Cópialo y lánzalo:
+
+```bash
+python src/AI_Model/main.py --sessions 10000 \
+    --training-mode single --board-size 10 \
+    --learning-rate 0.000307 --gamma 0.9866 --batch-size 128 \
+    --no-eat-reward -1.890 --hidden-layers 320,128
+```
+
+### 12bis.7 Workflow de defensa del proyecto
+
+Recomendación de orden si quieres maximizar nota:
+
+```bash
+# 1. Setup
+make setup
+
+# 2. Tune single 10×10 toda la noche (~5h)
+make tune TRIALS=30 BOARD=10
+
+# 3. Por la mañana, ver resultados
+make tune-inspect BOARD=10
+
+# 4. Entrenar modelo single 10×10 final con los mejores params
+#    (usa el comando ready-to-paste del paso anterior, ~3-5h)
+python src/AI_Model/main.py --sessions 10000 [...best params...]
+
+# 5. Generar los modelos 1/10/100 que pide el subject
+make models
+
+# 6. Tune multi por separado (~5-7h)
+make tune-multi TRIALS=30
+
+# 7. Modelo final multi
+make tune-inspect-multi
+python src/AI_Model/main.py --sessions 10000 [...multi best params...]
+
+# 8. Verificación visual
+make eval-visual BOARD=10 MODEL=<single 10x10 final>
+make eval-multi-visual MODEL=<multi final>
 ```
 
 ---
@@ -943,53 +1001,43 @@ python src/AI_Model/main.py --dontlearn --visual on --step-by-step \
 ## 13. Bonus — portabilidad de tamaño (`--training-mode multi`)
 
 El subject incluye como bonus que el mismo modelo entrenado pueda jugar en
-tableros 10×10, 14×14 y 18×18. Esto se cubre con el modo `multi`. Las
-secciones 3 y 4 explican las dos diferencias estructurales (input y red);
-aquí van los detalles operativos.
+tableros 10×10, 14×14 y 18×18. Esto se cubre con el modo `multi` — un único
+modelo, expuesto durante el entrenamiento a los tres tamaños.
 
 ### 13.1 Diferencias respecto al modo `single`
 
-| Aspecto                  | `single` (default)                              | `multi` (bonus)                                |
-|--------------------------|-------------------------------------------------|------------------------------------------------|
-| Input de la red          | One-hot 240D (10×10) / 336D / 432D              | **16D fijo** (4 dirs × 4 features `1/d`)       |
-| Arquitectura             | `512 → 256 → 128 → 4` con dropout (~288 K params) | `64 → 64 → 4` (~5 K params)                  |
-| Tamaño de tablero entrenamiento | Fijo (`--board-size`)                    | Sampleado por episodio: 70% 10×10, 15% 14×14, 15% 18×18 |
-| Carpeta de salida        | `models/<size>x<size>/`                          | `models/multi/`                                |
-| `name_tag` en filename   | `<size>x<size>`                                  | `multi`                                        |
-| Metadata `mode` en JSON  | `"single"`                                       | `"multi"`                                      |
-| Metadata `board_size`    | El número (10/14/18)                              | `null`                                         |
-| Botones en la UI         | 1 (sólo el tamaño entrenado)                    | 3 (selección libre)                            |
+Arquitectura, encoder e hiperparámetros son **idénticos**. La única diferencia
+es el muestreo del tamaño de tablero por episodio:
 
-### 13.2 Sampling 70/15/15 — por qué no uniforme
+| Aspecto                          | `single` (default)               | `multi` (bonus)                          |
+|----------------------------------|----------------------------------|------------------------------------------|
+| Tamaño de tablero entrenamiento  | Fijo (`--board-size`)            | Sampleado uniformemente: 33% / 33% / 33% |
+| Carpeta de salida                | `models/<size>x<size>/`          | `models/multi/`                          |
+| `name_tag` en filename           | `<size>x<size>`                  | `multi`                                  |
+| Metadata `mode` en JSON          | `"single"`                       | `"multi"`                                |
+| Metadata `board_size`            | El número (10/14/18)             | `null`                                   |
+| Botones en la UI                 | 1 (sólo el tamaño entrenado)     | 3 (selección libre)                      |
 
-[main.py:94-95](src/AI_Model/main.py#L94):
+### 13.2 Sampling uniforme 33/33/33
+
+[main.py](src/AI_Model/main.py):
 
 ```python
 MULTI_BOARD_SIZES = [10, 14, 18]
-MULTI_BOARD_WEIGHTS = [0.7, 0.15, 0.15]
+MULTI_BOARD_WEIGHTS = [1/3, 1/3, 1/3]
 ```
 
-Si se entrenara uniformemente (33/33/33), la red dedicaría más gradiente del
-necesario a 14×14 y 18×18, donde los episodios son **más largos y aportan
-más transiciones por episodio**. El resultado es que el rendimiento en 10×10
-— el "tablero canónico" del subject — cae respecto a la baseline `single`.
-
-El reparto 70/15/15 mantiene la prioridad sobre 10×10 (caso de uso principal)
-mientras expone a la red lo suficiente a 14/18 para que generalice.
+Cada episodio se elige aleatoriamente uno de los tres tamaños con la misma
+probabilidad. La red ve los tres regímenes (10×10 corto-y-denso, 14×14
+intermedio, 18×18 largo-y-disperso) por igual a lo largo del entrenamiento.
 
 ### 13.3 Por qué la representación 16D es portable
 
-La red `multi` aprende a partir de **distancias relativas**, que son
-**invariantes a la longitud del brazo**. Un Q-value alto para "ir UP cuando
-hay manzana verde a `1/3` de distancia y pared a `1/8`" tiene el mismo
-significado en cualquier tamaño de tablero — la red no aprende posiciones,
-sino **relaciones espaciales**.
-
-El modo `single` no podía trasladarse: su input one-hot codifica
-explícitamente la posición de cada celda del brazo, y la matriz de pesos de
-la primera capa está dimensionada al `board_size` concreto. Cambiar de
-10×10 a 14×14 implicaría literalmente otra red (otra forma de input → otro
-número de pesos en la capa 1).
+La red aprende a partir de **distancias relativas**, que son invariantes a
+la longitud del brazo. Un Q-value alto para "ir UP cuando hay manzana verde
+a `1/3` de distancia y pared a `1/8`" tiene el mismo significado en
+cualquier tamaño de tablero — la red no aprende posiciones, sino
+**relaciones espaciales**.
 
 ### 13.4 Flujo de selección de tamaño en runtime (evaluación)
 
@@ -1001,7 +1049,6 @@ número de pesos en la capa 1).
                                  ▼
                     ┌──────────────────────────┐
                     │   Agent(mode=…)           │
-                    │   con la red correcta    │
                     └────────────┬─────────────┘
                                  ▼
        --visual on ?  ──────────────────────────
@@ -1022,32 +1069,72 @@ número de pesos en la capa 1).
 
 ## 14. Hiperparámetros — resumen
 
-Todos los hiperparámetros del algoritmo (replay, target net, ε, recompensas)
-son **idénticos para los dos modos**. La única diferencia está en la
-arquitectura de la red.
+Idénticos para los dos modos (la única diferencia entre `single` y `multi`
+es el muestreo de tamaños).
 
-| Parámetro                     | Valor               | Modo   | Ubicación                                                          |
-|-------------------------------|---------------------|--------|--------------------------------------------------------------------|
-| Learning rate base            | 0.0005              | ambos  | [Agent.py:67](src/AI_Model/Agent.py#L67)                           |
-| Learning rate (spike cycles)  | 0.001               | ambos  | [main.py:420](src/AI_Model/main.py#L420)                           |
-| Discount factor `γ`           | 0.98                | ambos  | [Agent.py:56](src/AI_Model/Agent.py#L56)                           |
-| Replay buffer size            | 150 000             | ambos  | [Agent.py:81](src/AI_Model/Agent.py#L81)                           |
-| Mini-batch                    | 512                 | ambos  | [Agent.py:84](src/AI_Model/Agent.py#L84)                           |
-| Target update freq            | 1000                | ambos  | [Agent.py:85](src/AI_Model/Agent.py#L85)                           |
-| ε inicial / final             | 1.0 / 0.01          | ambos  | [main.py:147,191](src/AI_Model/main.py#L147)                       |
-| ε al continuar                | 0.005               | ambos  | [main.py:151](src/AI_Model/main.py#L151)                           |
-| Warmup episodios              | 200                 | ambos  | [main.py:189](src/AI_Model/main.py#L189)                           |
-| Decay end                     | 200 + min(35%·N, 4500) | ambos | [main.py:190](src/AI_Model/main.py#L190)                          |
-| Cycle period / spike length   | 200 / 30            | ambos  | [main.py:417-418](src/AI_Model/main.py#L417)                       |
-| Gradient clipping (norm)      | 1.0                 | ambos  | [Agent.py:67-69](src/AI_Model/Agent.py#L67)                        |
-| Loss                          | Huber δ = 1         | ambos  | [Agent.py:74](src/AI_Model/Agent.py#L74)                           |
-| Input size                    | `4·N·6` (240/336/432) | single | [Agent.py:62](src/AI_Model/Agent.py#L62)                          |
-| Input size                    | `16` (fijo)         | multi  | [Agent.py:65](src/AI_Model/Agent.py#L65)                           |
-| Capas ocultas                 | 512/256/128 + 2 dropout 0.1 | single | [Agent.py:101-110](src/AI_Model/Agent.py#L101)             |
-| Capas ocultas                 | 64/64               | multi  | [Agent.py:111-117](src/AI_Model/Agent.py#L111)                     |
-| Pesos por tamaño (sampling)   | 70/15/15 (10/14/18) | multi  | [main.py:95](src/AI_Model/main.py#L95)                             |
-| `max_steps` (timeout)         | `N² × 20`           | ambos  | [main.py:218](src/AI_Model/main.py#L218)                           |
-| `max_steps_without_food`      | `N² × max(2, len/6)` | ambos  | [main.py:269-273](src/AI_Model/main.py#L269)                       |
+| Parámetro                     | Valor                | Notas                                              |
+|-------------------------------|----------------------|----------------------------------------------------|
+| Learning rate base            | 0.000216             | Optuna-tuned                                       |
+| Learning rate (spike cycles)  | 5 × lr_base          | Spike de exploración cada 200 episodios            |
+| Discount factor `γ`           | 0.9646               | Optuna-tuned                                       |
+| Replay buffer size            | 150 000              | ~750 episodios de cobertura                        |
+| Mini-batch                    | 512                  |                                                    |
+| Target update freq            | 1000 steps           |                                                    |
+| ε inicial / final             | 1.0 / 0.01           |                                                    |
+| ε al continuar                | 0.005                | Cuando se carga un modelo y se continúa            |
+| Warmup episodios              | 200                  | Llenado de buffer antes de empezar a entrenar      |
+| Decay end                     | 200 + min(35%·N, 4500) | Fin del decaimiento lineal de ε                  |
+| Cycle period / spike length   | 200 / 30             | Periodos de exploración en la fase de explotación  |
+| Gradient clipping (norm)      | 1.0                  | Adam clipnorm                                      |
+| Loss                          | Huber δ = 1          |                                                    |
+| Input size                    | 16                   | Encoder `1/distancia` × 4 entidades × 4 direcciones |
+| Capas ocultas (default)       | 64, 64               | Optuna puede sobrescribir vía `--hidden-layers`    |
+| Dropout (default)             | 0.0                  | Optuna puede activarlo                             |
+| Reward `NO_EAT`               | -1.284               | Optuna-tuned                                       |
+| Reward `GREEN_APPLE`          | +50                  |                                                    |
+| Reward `RED_APPLE`            | -10                  |                                                    |
+| Reward `INSTANT_GAMEOVER`     | -100                 |                                                    |
+| Reward timeout `max_steps`    | -50                  | Penalización de paso por exceso                    |
+| Pesos sampling tamaños        | 1/3, 1/3, 1/3        | Sólo en `multi`                                    |
+| `max_steps` (timeout)         | `N² × 20`            |                                                    |
+| `max_steps_without_food`      | `N² × max(2, len/6)` |                                                    |
+
+### 14.1 Hiperparámetros tuneables por Optuna
+
+| Hiperparámetro | Rango / espacio                  |
+|----------------|----------------------------------|
+| `learning_rate`| log-uniform `[1e-4, 3e-3]`       |
+| `gamma`        | uniform `[0.92, 0.99]`           |
+| `batch_size`   | categorical `{128, 256, 512, 1024}` |
+| `NO_EAT`       | uniform `[-2.0, -0.1]`           |
+| `num_layers`   | int `[2, 4]`                     |
+| `units_l*`     | int `[32, 256]` step 32 (cada capa) |
+
+Los demás (replay size, gamma del LR spike, target sync, recompensas
+distintas a NO_EAT) están fijados como constantes — se pueden cambiar
+manualmente vía CLI o editando el código si quieres ampliar el espacio.
+
+### 14.2 Pruning de Optuna — comportamiento por defecto
+
+Para no matar trials buenos por error, el pruning es **lenient**:
+
+| Mecanismo            | Default                     | Función                                        |
+|----------------------|-----------------------------|------------------------------------------------|
+| Pruner base          | `PercentilePruner(25)`      | Sólo mata el bottom-25% de trials por checkpoint (no el bottom-50% del `MedianPruner` clásico). |
+| Wrapper              | `PatientPruner(patience=2)` | Un trial necesita **2 lecturas malas consecutivas** antes de poder morir. |
+| `n_warmup_steps`     | `1500`                      | No se considera prunear hasta el episodio 1500 — la fase de decay de ε ha terminado. |
+| `n_startup_trials`   | `5`                         | Los primeros 5 trials siempre se completan (poblar la base de comparación). |
+| `interval_steps`     | `100`                       | Frecuencia de chequeo (cada 100 episodios reportados). |
+| Métrica de comparación | rolling-200 avg de scores | Más estable que el score puntual.              |
+
+Para más / menos agresividad:
+
+```bash
+make tune PRUNER=none                # 0 pruning
+make tune PRUNER=median PATIENCE=0   # clásico Optuna (agresivo)
+make tune PRUNE_PCT=10               # mata sólo el bottom-10%
+make tune N_WARMUP_STEPS=2500        # juzgar más tarde aún
+```
 
 ---
 
@@ -1091,6 +1178,25 @@ Cada `*_metadata.json` contiene como mínimo:
 
 `mode` y `board_size` son los campos **clave** para que `--load` reconstruya
 la arquitectura correcta del `Agent`.
+
+### 15.1 Artefactos de Optuna
+
+```
+optuna_studies/
+├── snake-single-10.db    # SQLite con trials, params, valores, estados
+├── snake-single-14.db
+├── snake-single-18.db
+└── snake-multi.db
+
+optuna_results/
+└── best_<mode>_<timestamp>.json   # snapshot del best trial al cierre
+```
+
+La SQLite es la fuente de verdad — `make tune-inspect` lee directamente de
+ahí. El JSON es un snapshot que se reescribe al final de cada `make tune`.
+
+Re-lanzar `make tune` con el mismo `--study-name` (default: derivado de
+`mode`+`board`) **continúa el study existente**, añadiendo trials encima.
 
 ---
 

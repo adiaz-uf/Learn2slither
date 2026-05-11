@@ -5,18 +5,34 @@ Runs many short training trials with different hyperparameter combinations
 and reports the best ones. The trial metric is the rolling-200 average of
 the final score, computed from the last 200 episodes of each trial.
 
-Tunable hyperparameters (matches the user's spec):
-  - learning_rate : log-uniform [1e-4, 2e-3]
-  - gamma         : uniform [0.92, 0.99]
+Tunable hyperparameters (centred on values that work for the 16-D
+feature input + a small MLP):
+  - learning_rate : log-uniform [3e-4, 1.5e-3]
+  - gamma         : uniform [0.95, 0.99]
   - batch_size    : categorical {128, 256, 512, 1024}
-  - NO_EAT        : uniform [-2.0, -0.1]
-  - hidden_layers : 2-4 layers, 64-512 units each (step 64)
+  - NO_EAT        : uniform [-1.0, -0.2]
+  - hidden_layers : 2-3 layers, 32-160 units each (step 32)
 
-Pruning:
-  Optuna's MedianPruner cuts unpromising trials early using the
-  intermediate rolling-200 averages reported by train_agent every 100
-  episodes. Trials whose rolling-200 lags significantly behind the median
-  of completed trials are aborted.
+The first trial of every fresh study is seeded with a known-good
+baseline (lr=5e-4, gamma=0.98, NO_EAT=-0.3, [64,64], batch=512) so the
+study has a reasonable reference value from the start instead of
+suffering through random startup samples.
+
+Pruning (lenient by design — late-bloomer-friendly):
+  - Pruner: PercentilePruner(25) wrapped by PatientPruner(patience=2).
+    Only the bottom 25% of trials get pruned at any checkpoint, and a
+    trial is allowed two consecutive bad readings before pruning fires.
+    The combination avoids killing trials that improve slowly or that
+    have a temporary dip in the rolling-200 average.
+  - Warmup: pruning is disabled until ``n_warmup_steps`` (default 1500)
+    so trials always get to finish their epsilon-decay phase before
+    being judged. With the default schedule, decay ends near episode
+    1880 for a 5000-episode trial, so anything after step 1500 is
+    showing genuine policy quality, not exploration noise.
+  - Reporting: train_agent calls back every 100 episodes with the
+    rolling-200 average of episode scores.
+  - Use ``--pruner none`` to disable pruning entirely (max safety).
+  - Use ``--pruner median`` for the classic (more aggressive) behaviour.
 
 Usage:
     python src/AI_Model/tune.py --trials 50 --episodes-per-trial 1500
@@ -38,7 +54,12 @@ from datetime import datetime
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 import optuna  # noqa: E402
-from optuna.pruners import MedianPruner  # noqa: E402
+from optuna.pruners import (  # noqa: E402
+    MedianPruner,
+    NopPruner,
+    PatientPruner,
+    PercentilePruner,
+)
 from optuna.samplers import TPESampler  # noqa: E402
 
 # Make sibling modules importable when running this file directly
@@ -48,21 +69,29 @@ from main import train_agent  # noqa: E402
 
 
 def _suggest_hyperparameters(trial, mode):
-    """Sample a complete hyperparameter set from the trial's search space."""
+    """
+    Sample a complete hyperparameter set from the trial's search space.
+
+    Ranges are tuned for a 16-D dense input + a small MLP: layer widths
+    above ~160 over-parameterise the network, lr below 3e-4 trains too
+    slowly within a single trial's budget, and NO_EAT below -1.0 makes
+    the agent prefer suicide over exploration. The baseline known-good
+    config (5e-4 / 0.98 / -0.3 / [64,64]) sits in the middle of these
+    ranges so TPE can refine around it.
+    """
     learning_rate = trial.suggest_float(
-        'learning_rate', 1e-4, 2e-3, log=True
+        'learning_rate', 3e-4, 1.5e-3, log=True
     )
-    gamma = trial.suggest_float('gamma', 0.92, 0.99)
+    gamma = trial.suggest_float('gamma', 0.95, 0.99)
     batch_size = trial.suggest_categorical(
         'batch_size', [128, 256, 512, 1024]
     )
-    no_eat = trial.suggest_float('no_eat', -2.0, -0.1)
+    no_eat = trial.suggest_float('no_eat', -1.0, -0.2)
 
-    # Architecture: 2-4 hidden layers, 64-512 units each.
-    # Conditional sampling — only sample as many layer widths as needed.
-    num_layers = trial.suggest_int('num_layers', 2, 4)
+    # Architecture: 2-3 hidden layers, 32-160 units each.
+    num_layers = trial.suggest_int('num_layers', 2, 3)
     hidden_layers = [
-        trial.suggest_int(f'units_l{i}', 64, 512, step=64)
+        trial.suggest_int(f'units_l{i}', 32, 160, step=32)
         for i in range(num_layers)
     ]
 
@@ -75,6 +104,38 @@ def _suggest_hyperparameters(trial, mode):
         'num_layers': num_layers,
         'mode': mode,
     }
+
+
+# Known-good hyperparameter set that produced solid scores in earlier
+# multi-mode training. Used as the first enqueued trial so every fresh
+# study starts from a sensible reference instead of pure random samples.
+BASELINE_PARAMS = {
+    'learning_rate': 5e-4,
+    'gamma': 0.98,
+    'batch_size': 512,
+    'no_eat': -0.3,
+    'num_layers': 2,
+    'units_l0': 64,
+    'units_l1': 64,
+}
+
+
+def _enqueue_baseline(study):
+    """
+    Enqueue the known-good baseline as the next trial (if not already
+    present). Subsequent calls are idempotent: re-running ``make tune``
+    on an existing study won't duplicate the baseline because the
+    matching params will be skipped by Optuna.
+    """
+    # Check if any completed trial already has these exact params.
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.COMPLETE:
+            if all(
+                t.params.get(k) == v for k, v in BASELINE_PARAMS.items()
+            ):
+                return False
+    study.enqueue_trial(BASELINE_PARAMS)
+    return True
 
 
 def _build_objective(args):
@@ -243,13 +304,54 @@ def main():
     )
     parser.add_argument(
         '--n-startup-trials', type=int, default=5,
-        help='Random trials before TPE kicks in (default: 5).',
+        help=(
+            'Number of completed trials required before any pruning '
+            'comparison runs (default: 5). Below this threshold every '
+            'trial finishes regardless of intermediate values.'
+        ),
     )
     parser.add_argument(
-        '--n-warmup-steps', type=int, default=200,
+        '--n-warmup-steps', type=int, default=1500,
         help=(
-            'Episodes before pruning becomes active for a trial '
-            '(default: 200).'
+            'Episodes a trial must run before becoming eligible for '
+            'pruning (default: 1500). Set high enough that the '
+            'epsilon-decay phase has finished — episodes before this '
+            'are dominated by exploration noise.'
+        ),
+    )
+    parser.add_argument(
+        '--pruner', choices=['percentile', 'median', 'none'],
+        default='percentile',
+        help=(
+            "Pruning strategy. 'percentile' (default) only kills the "
+            "bottom 25%% of trials at each checkpoint; 'median' is the "
+            "classic (more aggressive) Optuna default; 'none' disables "
+            "pruning entirely."
+        ),
+    )
+    parser.add_argument(
+        '--prune-percentile', type=float, default=25.0,
+        help=(
+            "Percentile threshold for the 'percentile' pruner: trials "
+            "whose intermediate value falls below this percentile of "
+            "completed trials at the same step are pruned. Lower = "
+            "more lenient (default: 25.0)."
+        ),
+    )
+    parser.add_argument(
+        '--patience', type=int, default=2,
+        help=(
+            'Wrap the pruner with PatientPruner(patience=N): a trial '
+            "must report at least N consecutive bad values before being "
+            'pruned (default: 2). Set to 0 to disable patience.'
+        ),
+    )
+    parser.add_argument(
+        '--no-baseline', action='store_true',
+        help=(
+            'Do not enqueue the known-good baseline as the first trial. '
+            'Off by default (the baseline is always enqueued on a fresh '
+            'study; idempotent on resume).'
         ),
     )
     args = parser.parse_args()
@@ -267,11 +369,35 @@ def main():
         args.storage = f'sqlite:///optuna_studies/{args.study_name}.db'
 
     sampler = TPESampler(seed=args.seed)
-    pruner = MedianPruner(
-        n_startup_trials=args.n_startup_trials,
-        n_warmup_steps=args.n_warmup_steps,
-        interval_steps=100,
-    )
+    # Build the base pruner from --pruner. PercentilePruner with a low
+    # percentile (default 25) is the lenient choice — it only prunes
+    # trials that fall below the bottom-25% of completed trials at the
+    # same step, leaving median-or-better trials alive.
+    if args.pruner == 'none':
+        base_pruner = NopPruner()
+    elif args.pruner == 'median':
+        base_pruner = MedianPruner(
+            n_startup_trials=args.n_startup_trials,
+            n_warmup_steps=args.n_warmup_steps,
+            interval_steps=100,
+        )
+    else:  # 'percentile' (default)
+        base_pruner = PercentilePruner(
+            percentile=args.prune_percentile,
+            n_startup_trials=args.n_startup_trials,
+            n_warmup_steps=args.n_warmup_steps,
+            interval_steps=100,
+        )
+
+    # PatientPruner adds hysteresis: a trial that drops below the
+    # threshold once is given a few more checkpoints to recover before
+    # being killed. Avoids pruning trials with transient dips in the
+    # rolling-200 average (especially common during the first exploration
+    # cycle after the decay phase ends).
+    if args.patience > 0 and args.pruner != 'none':
+        pruner = PatientPruner(base_pruner, patience=args.patience)
+    else:
+        pruner = base_pruner
 
     study = optuna.create_study(
         study_name=args.study_name,
@@ -282,6 +408,13 @@ def main():
         load_if_exists=True,
     )
 
+    # Seed the study with a known-good baseline so trial 0 has a
+    # reasonable score and TPE has a sane starting point. No-op if a
+    # completed trial with the same params already exists.
+    enqueued_baseline = False
+    if not args.no_baseline:
+        enqueued_baseline = _enqueue_baseline(study)
+
     print(f"{'=' * 60}")
     print(f"  Study:              {args.study_name}")
     print(f"  Storage:            {args.storage}")
@@ -291,6 +424,11 @@ def main():
     if args.training_mode == 'single':
         print(f"  Board:              {args.board_size}x{args.board_size}")
     print(f"  Existing trials:    {len(study.trials)}")
+    if enqueued_baseline:
+        print(
+            "  Baseline enqueued:  yes (lr=5e-4, gamma=0.98, "
+            "NO_EAT=-0.3, [64,64])"
+        )
     print(f"{'=' * 60}\n")
 
     objective = _build_objective(args)

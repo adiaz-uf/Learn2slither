@@ -1,0 +1,9 @@
+{
+  "mode": "single",
+  "board_size": 10,
+  "total_episodes": 4785,
+  "high_score": 50,
+  "rolling_200_avg": 24.5,
+  "epsilon": 0.005,
+  "timestamp": "2026-05-10T11:04:32.956657"
+}

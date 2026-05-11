@@ -92,16 +92,17 @@ def _wait_for_step(visualize):
 # ---------------------------------------------------------------------------
 
 MULTI_BOARD_SIZES = [10, 14, 18]
-MULTI_BOARD_WEIGHTS = [0.7, 0.15, 0.15]
+# Equal-weight sampling across the three sizes during multi training.
+MULTI_BOARD_WEIGHTS = [1.0 / 3, 1.0 / 3, 1.0 / 3]
 
 
 def _sample_board_size(training_mode, default_size):
     """
     Pick the board size for the next episode.
 
-    In single mode, always returns default_size. In multi mode, samples from
-    [10, 14, 18] with weights [0.7, 0.15, 0.15] so 10x10 dominates training
-    while the other sizes provide enough exposure for transfer.
+    In single mode, always returns ``default_size``. In multi mode, samples
+    one of [10, 14, 18] uniformly so the model is exposed equally to all
+    three sizes.
     """
     if training_mode == 'multi':
         return random.choices(
@@ -802,9 +803,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--training-mode', choices=['single', 'multi'], default='single',
-        help="'single': train one model dedicated to --board-size (default). "
-             "'multi': size-invariant training, each episode samples a board "
-             "size from [10, 14, 18] (size-portability bonus).",
+        help="'single': every episode is played on --board-size (default). "
+             "'multi': each episode samples uniformly from [10, 14, 18] "
+             "(size-portability bonus). Architecture is the same in both "
+             "modes.",
     )
     parser.add_argument(
         '--fps', type=int, default=10,
@@ -818,7 +820,7 @@ if __name__ == "__main__":
     # --- Tunable hyperparameters (defaults match prior hardcoded values) ---
     parser.add_argument(
         '--learning-rate', type=float, default=0.000216,
-        help='Adam base learning rate (default: 0.000216, Optuna-tuned).',
+        help='Adam base learning rate (default: 0.000216).',
     )
     parser.add_argument(
         '--gamma', type=float, default=0.9646,
@@ -830,13 +832,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--no-eat-reward', type=float, default=None,
-        help=('Override Board.NO_EAT (default: -1.284, Optuna-tuned). '
-              'A larger negative value discourages aimless looping.'),
+        help=('Override Board.NO_EAT (default: -1.284). A larger negative '
+              'value discourages aimless looping.'),
     )
     parser.add_argument(
         '--hidden-layers', type=str, default=None,
         help=('Comma-separated hidden-layer unit counts, e.g. "256,128,64". '
-              'Default: 448,320,64 (single) / 64,64 (multi).'),
+              'Default: 64,64.'),
     )
     parser.add_argument(
         '--dropout', type=float, default=None,
@@ -898,15 +900,16 @@ if __name__ == "__main__":
             )
             training_mode = loaded_mode
 
-        # In single mode, the board size is part of the architecture
-        # (input shape depends on it). In multi mode any size works.
+        # The encoder is size-invariant, so single and multi share the
+        # same architecture. ``mode`` is kept only to label the agent
+        # and let the UI decide the size selector.
         if loaded_mode == 'single':
             if (loaded_board_size is not None
                     and loaded_board_size != board_size):
                 print(
-                    f"Note: this single-mode model was trained for "
+                    f"Note: this single-mode model was trained on "
                     f"{loaded_board_size}x{loaded_board_size}; "
-                    f"overriding --board-size to that value."
+                    f"using that as the default board size."
                 )
                 board_size = loaded_board_size
             agent = Agent(board_size=board_size, mode='single')
@@ -915,23 +918,39 @@ if __name__ == "__main__":
 
         try:
             from tensorflow import keras as tf_keras
-            agent.model = tf_keras.models.load_model(args.load)
-            # Rebuild target_model to match the loaded architecture.
-            # Necessary because older checkpoints may have a different
-            # network shape than the current default; without this clone
-            # `set_weights` would fail on architecture mismatch.
+            loaded = tf_keras.models.load_model(args.load)
+            # Reject legacy one-hot models: the encoder is now 16-D only.
+            loaded_input = loaded.input_shape[-1]
+            if loaded_input != Agent.INPUT_SIZE:
+                print(
+                    f"Error: model '{args.load}' has input shape "
+                    f"{loaded_input}, expected {Agent.INPUT_SIZE}."
+                )
+                print(
+                    "This model was trained with the legacy one-hot "
+                    "encoder and is no longer supported. Train a new "
+                    "model with the current code."
+                )
+                sys.exit(1)
+            agent.model = loaded
+            # Rebuild target_model to match the loaded architecture so
+            # that subsequent `set_weights` calls don't fail on shape
+            # mismatch.
             agent.target_model = tf_keras.models.clone_model(agent.model)
             agent.target_model.set_weights(agent.model.get_weights())
             # Sync the agent's hidden_layers attribute to reflect the
-            # actually-loaded architecture (not the constructor default).
+            # actually-loaded architecture.
             agent.hidden_layers = [
                 layer.units
                 for layer in agent.model.layers
-                if hasattr(layer, 'units') and layer.units != agent.output_size
+                if hasattr(layer, 'units')
+                and layer.units != agent.output_size
             ]
             print(f"Model loaded: {args.load} (mode={loaded_mode})")
             if start_episode:
                 print(f"Resuming from episode {start_episode}")
+        except SystemExit:
+            raise
         except Exception as exc:
             print(f"Error loading model: {exc}")
             sys.exit(1)

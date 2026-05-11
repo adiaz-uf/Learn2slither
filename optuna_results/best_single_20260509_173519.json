@@ -1,0 +1,18 @@
+{
+  "study_name": "snake-single-10",
+  "training_mode": "single",
+  "board_size": 10,
+  "episodes_per_trial": 5000,
+  "n_trials_completed": 7,
+  "best_value": 18.535,
+  "best_params": {
+    "learning_rate": 0.001429088578508835,
+    "gamma": 0.9832977056320169,
+    "batch_size": 1024,
+    "no_eat": -0.5801948546942097,
+    "num_layers": 2,
+    "units_l0": 64,
+    "units_l1": 128
+  },
+  "timestamp": "20260509_173519"
+}
