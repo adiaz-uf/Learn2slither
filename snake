@@ -16,4 +16,51 @@ else
     PY="python"
 fi
 
+# ---------------------------------------------------------------------------
+# Linux-only: prevent pygame.display.flip() from segfaulting on systems
+# where the only available GL backend is Mesa software (swrast_dri.so).
+#
+# Root cause: TensorFlow's libtensorflow_framework.so bundles an old LLVM
+# and exports its symbols globally. Mesa's swrast_dri.so also uses LLVM
+# (LLVMpipe) and ends up resolving against TF's bundled version → ABI
+# mismatch → SIGSEGV in llvm::FixedVectorType::get.
+#
+# Fix: preload the system's libstdc++ and libLLVM so they win symbol
+# resolution before TF loads its own bundled copies.
+# ---------------------------------------------------------------------------
+if [ "$(uname -s)" = "Linux" ]; then
+    PRELOADS=()
+
+    # System libstdc++ first — TF often bundles an older one.
+    for cand in \
+        /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+        /usr/lib64/libstdc++.so.6
+    do
+        if [ -f "$cand" ]; then
+            PRELOADS+=("$cand")
+            break
+        fi
+    done
+
+    # System libLLVM. Try common version-suffixed names.
+    for cand in \
+        /usr/lib/x86_64-linux-gnu/libLLVM.so \
+        /usr/lib/x86_64-linux-gnu/libLLVM-17.so \
+        /usr/lib/x86_64-linux-gnu/libLLVM-16.so \
+        /usr/lib/x86_64-linux-gnu/libLLVM-15.so \
+        /usr/lib/x86_64-linux-gnu/libLLVM-14.so \
+        /usr/lib/x86_64-linux-gnu/libLLVM-13.so
+    do
+        if [ -f "$cand" ]; then
+            PRELOADS+=("$cand")
+            break
+        fi
+    done
+
+    if [ "${#PRELOADS[@]}" -gt 0 ]; then
+        joined="$(IFS=':'; echo "${PRELOADS[*]}")"
+        export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$joined"
+    fi
+fi
+
 exec "$PY" "$MAIN" "$@"
