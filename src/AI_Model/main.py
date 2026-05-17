@@ -52,6 +52,16 @@ if sys.platform.startswith('linux'):
     # (C) SDL backend hints — only on Linux.
     os.environ.setdefault('SDL_VIDEODRIVER', 'x11')
     os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
+    # Disable hardware-accelerated framebuffer and force the software
+    # renderer. This stops SDL from loading Mesa's swrast_dri.so / GL
+    # stack, which is what triggers the LLVM-symbol clash with TF on
+    # cluster machines without GPU passthrough.
+    os.environ.setdefault('SDL_FRAMEBUFFER_ACCELERATION', '0')
+    os.environ.setdefault('SDL_RENDER_DRIVER', 'software')
+    os.environ.setdefault('SDL_HINT_RENDER_DRIVER', 'software')
+    # Disable the EGL/GLX path explicitly so SDL never tries to create
+    # a GL context for the window.
+    os.environ.setdefault('SDL_VIDEO_X11_FORCE_EGL', '0')
 
 # (D) Initialise SDL subsystems BEFORE TensorFlow is imported. Only the
 # ones we actually use (display + font). pygame.init() would also try to
@@ -60,6 +70,24 @@ if sys.platform.startswith('linux'):
 # again later (in BoardGameUI, StartScreen, etc.) is harmless.
 pygame.display.init()
 pygame.font.init()
+
+# Pre-warm SDL: force a real set_mode + flip BEFORE TensorFlow loads.
+# Whatever GL/Mesa libraries SDL needs are dlopened here and resolve
+# their LLVM symbols against the system libLLVM. By the time TF later
+# brings in its own bundled LLVM, those modules have already snapshot
+# their symbol table — no re-lookup, no clash. Linux only; the visible
+# 1×1 window is closed immediately.
+if sys.platform.startswith('linux'):
+    try:
+        _warmup_surface = pygame.display.set_mode((1, 1))
+        pygame.display.flip()
+        pygame.display.quit()
+        pygame.display.init()
+    except pygame.error:
+        # If pre-warm fails we still want to try the real run; the
+        # later set_mode will raise the same error with a clearer
+        # stack trace.
+        pass
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
