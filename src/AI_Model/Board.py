@@ -9,10 +9,6 @@ import numpy as np
 
 from Snake import Snake
 
-# Default reward constants. Per-instance overrides are accepted by
-# Board.__init__ via the `rewards` dict (used by Optuna tuning).
-# NO_EAT was tuned by Optuna (study snake-single-10) — the larger
-# negative value materially reduces aimless looping.
 INSTANT_GAMEOVER = -100
 GREEN_APPLE = 50
 RED_APPLE = -10

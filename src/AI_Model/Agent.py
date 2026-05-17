@@ -235,16 +235,26 @@ class Agent:
         # evaluate the best next action, which systematically overestimates
         # Q-values. Double DQN separates the two roles: the main network
         # selects the action, the target network evaluates it.
+        # Student looks at s' and gives 4 Q-values per state.
         next_q_main = self.model(next_states, training=False).numpy()
+        # Student picks the action it thinks is best in s', [batch_size]
         best_actions = np.argmax(next_q_main, axis=1)
+        # Teacher (frozen copy) also looks at s' and gives its own 4
+        # Q-values, [batch_size, 4]
         next_q_target = self.target_model(
             next_states, training=False
         ).numpy()
+        # Teacher's score for the action the student picked
+        # (Double DQN split), [batch_size]
         max_next_q = next_q_target[
             np.arange(len(best_actions)), best_actions
         ]
+        # Correct answer to learn (Bellman):
+        # reward now + discounted future (0 if done), [batch_size]
         targets = rewards + (1 - dones) * self.gamma * max_next_q
 
+        # One gradient step: nudge student so Q(s, a) gets closer to
+        # target, [batch_size]
         loss = self._train_step(states, actions, targets)
         self.train_count += 1
 

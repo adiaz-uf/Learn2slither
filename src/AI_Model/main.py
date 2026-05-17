@@ -304,10 +304,6 @@ def train_agent(
             #   length 12 -> 200 steps  (board_size^2 * 2)
             #   length 18 -> 300 steps
             #   length 24 -> 400 steps
-            #   length 30 -> 500 steps
-            #   length 36 -> 600 steps
-            #   length 42 -> 700 steps
-            #   length 48 -> 800 steps
             current_length = len(board.snake.body) + 1
             max_steps_without_food = (
                 current_board_size * current_board_size
@@ -768,29 +764,35 @@ if __name__ == "__main__":
 
     # --- Training arguments ---
     parser.add_argument(
-        '--sessions', type=int, default=100,
+        '-sessions', '--sessions', type=int, default=100,
+        dest='sessions',
         help='Number of training episodes (default: 100)',
     )
     parser.add_argument(
-        '--load', type=str, default=None,
+        '-load', '--load', type=str, default=None,
+        dest='load',
         help='Path to a pre-trained model file (.keras)',
     )
     parser.add_argument(
-        '--save', type=str, default=None,
+        '-save', '--save', type=str, default=None,
+        dest='save',
         help='Path to save the trained model (auto-generated if omitted)',
     )
 
     # --- Mode arguments ---
     parser.add_argument(
-        '--dontlearn', action='store_true',
+        '-dontlearn', '--dontlearn', action='store_true',
+        dest='dontlearn',
         help='Evaluation mode: run the agent without updating weights',
     )
     parser.add_argument(
-        '--visual', choices=['on', 'off'], default='off',
+        '-visual', '--visual', choices=['on', 'off'], default='off',
+        dest='visual',
         help='Enable pygame visualization (default: off)',
     )
     parser.add_argument(
-        '--step-by-step', action='store_true',
+        '-step-by-step', '--step-by-step', action='store_true',
+        dest='step_by_step',
         help=('Pause after every step and wait for user input '
               '(evaluation only)'),
     )

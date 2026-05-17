@@ -1,7 +1,9 @@
 PYTHON  ?= python3
 VENV_PY := .venv/bin/python
 PIP     := .venv/bin/pip
-MAIN    := src/AI_Model/main.py
+# Subject-mandated entrypoint. The wrapper picks the venv python when
+# present and forwards all arguments to src/AI_Model/main.py.
+SNAKE   := ./snake
 TUNE    := src/AI_Model/tune.py
 
 SESSIONS ?= 100
@@ -112,22 +114,22 @@ setup: create-venv install-deps
 # ---------------------------------------------------------------------------
 
 train:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) --board-size $(BOARD) \
+	$(SNAKE) --sessions $(SESSIONS) --board-size $(BOARD) \
 		--training-mode single --visual off \
 		$(if $(SAVE),--save $(SAVE),)
 
 train-visual:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) --board-size $(BOARD) \
+	$(SNAKE) --sessions $(SESSIONS) --board-size $(BOARD) \
 		--training-mode single --visual on --fps $(FPS) \
 		$(if $(SAVE),--save $(SAVE),)
 
 train-debug:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) --board-size $(BOARD) \
+	$(SNAKE) --sessions $(SESSIONS) --board-size $(BOARD) \
 		--training-mode single --visual off --debug \
 		$(if $(SAVE),--save $(SAVE),)
 
 train-continue:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) --board-size $(BOARD) \
+	$(SNAKE) --sessions $(SESSIONS) --board-size $(BOARD) \
 		--training-mode single --visual off --load $(MODEL) \
 		$(if $(SAVE),--save $(SAVE),)
 
@@ -139,17 +141,17 @@ train-continue:
 # ---------------------------------------------------------------------------
 
 train-multi:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) \
+	$(SNAKE) --sessions $(SESSIONS) \
 		--training-mode multi --visual off \
 		$(if $(SAVE),--save $(SAVE),)
 
 train-multi-debug:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) \
+	$(SNAKE) --sessions $(SESSIONS) \
 		--training-mode multi --visual off --debug \
 		$(if $(SAVE),--save $(SAVE),)
 
 train-multi-continue:
-	$(VENV_PY) $(MAIN) --sessions $(SESSIONS) \
+	$(SNAKE) --sessions $(SESSIONS) \
 		--training-mode multi --visual off --load $(MODEL) \
 		$(if $(SAVE),--save $(SAVE),)
 
@@ -160,15 +162,15 @@ train-multi-continue:
 # ---------------------------------------------------------------------------
 
 eval:
-	$(VENV_PY) $(MAIN) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
+	$(SNAKE) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
 		--board-size $(BOARD) --visual off
 
 eval-visual:
-	$(VENV_PY) $(MAIN) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
+	$(SNAKE) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
 		--board-size $(BOARD) --visual on --fps $(FPS)
 
 eval-step:
-	$(VENV_PY) $(MAIN) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
+	$(SNAKE) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
 		--board-size $(BOARD) --visual off --step-by-step
 
 # ---------------------------------------------------------------------------
@@ -178,11 +180,11 @@ eval-step:
 # ---------------------------------------------------------------------------
 
 eval-multi:
-	$(VENV_PY) $(MAIN) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
+	$(SNAKE) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
 		--board-size $(BOARD) --visual off
 
 eval-multi-visual:
-	$(VENV_PY) $(MAIN) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
+	$(SNAKE) --dontlearn --load $(MODEL) --sessions $(SESSIONS) \
 		--visual on --fps $(FPS)
 
 # ---------------------------------------------------------------------------
@@ -192,35 +194,35 @@ eval-multi-visual:
 # ---------------------------------------------------------------------------
 
 models-10:
-	$(VENV_PY) $(MAIN) --sessions 1   --board-size 10 --training-mode single \
+	$(SNAKE) --sessions 1   --board-size 10 --training-mode single \
 		--save models/10x10/snake_10x10_1sess.keras
-	$(VENV_PY) $(MAIN) --sessions 10  --board-size 10 --training-mode single \
+	$(SNAKE) --sessions 10  --board-size 10 --training-mode single \
 		--save models/10x10/snake_10x10_10sess.keras
-	$(VENV_PY) $(MAIN) --sessions 100 --board-size 10 --training-mode single \
+	$(SNAKE) --sessions 100 --board-size 10 --training-mode single \
 		--save models/10x10/snake_10x10_100sess.keras
 
 models-14:
-	$(VENV_PY) $(MAIN) --sessions 1   --board-size 14 --training-mode single \
+	$(SNAKE) --sessions 1   --board-size 14 --training-mode single \
 		--save models/14x14/snake_14x14_1sess.keras
-	$(VENV_PY) $(MAIN) --sessions 10  --board-size 14 --training-mode single \
+	$(SNAKE) --sessions 10  --board-size 14 --training-mode single \
 		--save models/14x14/snake_14x14_10sess.keras
-	$(VENV_PY) $(MAIN) --sessions 100 --board-size 14 --training-mode single \
+	$(SNAKE) --sessions 100 --board-size 14 --training-mode single \
 		--save models/14x14/snake_14x14_100sess.keras
 
 models-18:
-	$(VENV_PY) $(MAIN) --sessions 1   --board-size 18 --training-mode single \
+	$(SNAKE) --sessions 1   --board-size 18 --training-mode single \
 		--save models/18x18/snake_18x18_1sess.keras
-	$(VENV_PY) $(MAIN) --sessions 10  --board-size 18 --training-mode single \
+	$(SNAKE) --sessions 10  --board-size 18 --training-mode single \
 		--save models/18x18/snake_18x18_10sess.keras
-	$(VENV_PY) $(MAIN) --sessions 100 --board-size 18 --training-mode single \
+	$(SNAKE) --sessions 100 --board-size 18 --training-mode single \
 		--save models/18x18/snake_18x18_100sess.keras
 
 models-multi:
-	$(VENV_PY) $(MAIN) --sessions 1   --training-mode multi \
+	$(SNAKE) --sessions 1   --training-mode multi \
 		--save models/multi/snake_multi_1sess.keras
-	$(VENV_PY) $(MAIN) --sessions 10  --training-mode multi \
+	$(SNAKE) --sessions 10  --training-mode multi \
 		--save models/multi/snake_multi_10sess.keras
-	$(VENV_PY) $(MAIN) --sessions 100 --training-mode multi \
+	$(SNAKE) --sessions 100 --training-mode multi \
 		--save models/multi/snake_multi_100sess.keras
 
 models: models-10 models-14 models-18

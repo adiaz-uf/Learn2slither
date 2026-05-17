@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Wrapper to run Learn2Slither as `./snake` per the subject spec.
+# Forwards all arguments to src/AI_Model/main.py using the project venv
+# when available, otherwise falling back to the system python3.
+
+set -e
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAIN="$HERE/src/AI_Model/main.py"
+
+if [ -x "$HERE/.venv/bin/python" ]; then
+    PY="$HERE/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+else
+    PY="python"
+fi
+
+exec "$PY" "$MAIN" "$@"

@@ -502,229 +502,267 @@ acción, es improbable que la target también lo haga.
 
 ## 10. Anatomía del flujo de entrenamiento — paso a paso
 
-### 10.1 Vista de pájaro
+Esta sección describe **qué ocurre en cada step de entrenamiento** y, sobre
+todo, qué significa cada operando de cada fórmula. Es la referencia técnica
+del proyecto.
 
-[main.py train_agent()](src/AI_Model/main.py#L113):
+### 10.0 Resumen en una línea
+
+> Por cada movimiento de la serpiente: observa el estado, elige acción ε-greedy,
+> ejecuta y recibe recompensa, guarda la transición en memoria, **y entrena la
+> red con un mini-batch aleatorio del pasado** para que sus Q-values se acerquen
+> al target de Bellman.
+
+### 10.1 Vista de pájaro del bucle
 
 ```
-para cada episodio (1 a num_episodes):
-    [si modo multi] elegir current_board_size ← _sample_board_size()
-    crear Board(current_board_size + 2) e inicializar serpiente
+para cada episodio (1 .. num_episodes):
+    [multi] elegir current_board_size ← _sample_board_size()
+    crear Board e inicializar serpiente
 
     mientras no done:
-        ─────────── 1 PASO DE JUEGO ───────────
-        s     = board.get_snake_view()                  ← Paso 1
-        a     = agent.get_action(s, epsilon)            ← Paso 2
-        s', r = board.move_snake(directions_map[a])     ← Paso 3
-        actualizar contador anti-loop                   ← Paso 4a
-        chequear done (collision / loop / max_steps)    ← Paso 4b
-        agent.remember(s, a, r, s', done)               ← Paso 5
-        agent.replay()                                  ← Paso 6  ← corazón DQN
-        ────────────────────────────────────────
+        ─────────── 1 STEP ───────────
+        s     = board.get_snake_view()                  ← Paso 1: observar
+        a     = agent.get_action(s, ε)                  ← Paso 2: ε-greedy
+        s', r = board.move_snake(directions_map[a])     ← Paso 3: ejecutar
+        chequear done (collision / loop / max_steps)    ← Paso 4: terminación
+        agent.remember(s, a, r, s', done)               ← Paso 5: guardar
+        agent.replay()                                  ← Paso 6: ENTRENAR
+        ───────────────────────────────
 
     actualizar ε según schedule (sección 7)
-    guardar checkpoints best_*/best_avg_* si procede
+    guardar checkpoints best_* / best_avg_* si procede
 ```
 
-> El selector de `board_size` por episodio sólo existe en `multi`. En
-> `single` el tablero queda fijado al arranque por `--board-size`.
+| # | Acción | Código | Pieza DQN |
+|---|---|---|---|
+| 1 | Observar `s` (visión cruz) | [Board.py:121](src/AI_Model/Board.py#L121) `get_snake_view` | Observación |
+| 2 | Decidir `a` (ε-greedy) | [Agent.py:170](src/AI_Model/Agent.py#L170) `get_action` | Política |
+| 3 | Ejecutar `a`, recibir `r, s'` | [Board.py:167](src/AI_Model/Board.py#L167) `move_snake` | Interacción |
+| 4 | Chequeo done | [main.py:256-285](src/AI_Model/main.py#L256) | Terminación |
+| 5 | Guardar `(s,a,r,s',done)` | [Agent.py:184](src/AI_Model/Agent.py#L184) `remember` | Replay (write) |
+| 6 | `replay()` — corazón DQN | [Agent.py:204](src/AI_Model/Agent.py#L204) | **Update de θ** |
 
-### 10.2 Paso 1 — observar el estado
+Pasos 1-5 son la "interacción". El paso 6 es donde la red **realmente aprende**.
 
-[main.py:237](src/AI_Model/main.py#L237):
+### 10.2 El paso `replay()` en profundidad
+
+`replay()` se ejecuta **una vez por step** y entrena la red principal.
+
+#### Paso 6.1 — Sample del mini-batch
 
 ```python
-current_view = board.get_snake_view()
+minibatch = random.sample(self.memory, self.batch_size)  # B = 512
 ```
 
-`get_snake_view()` ([Board.py:121](src/AI_Model/Board.py#L121)) devuelve
-4 listas `[up, down, left, right]` con chars `0/W/S/G/R/H`. La salida es
-**igual para los dos modos**; la codificación a tensor ocurre dentro del
-agente.
+- `self.memory`: deque de hasta 150 000 transiciones pasadas.
+- Sample uniforme **sin reemplazo dentro del batch** (sí entre batches).
+- Cada transición es una tupla:
 
-### 10.3 Paso 2 — decidir acción (ε-greedy)
+| Símbolo | Qué es | Tipo |
+|---|---|---|
+| `s` | Estado en ese instante (vista cruda en cruz) | Lista de 4 brazos |
+| `a` | Acción tomada (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT) | int |
+| `r` | Recompensa observada tras la acción | float |
+| `s'` | Estado siguiente | Lista de 4 brazos |
+| `done` | ¿Terminó el episodio en esa transición? | 0 o 1 |
 
-[main.py:240](src/AI_Model/main.py#L240) → [Agent.py:221](src/AI_Model/Agent.py#L221):
+#### Paso 6.2 — Codificar a features 16-D
+
+Las vistas crudas (chars `W/S/G/R/0`) se convierten al vector denso vía
+`process_view` (sección 4):
+
+```
+s  → states       (shape [512, 16])
+s' → next_states  (shape [512, 16])
+```
+
+`actions`, `rewards`, `dones` se montan como arrays `[512]`.
+
+#### Paso 6.3 — Construir el target con Double DQN
+
+La fórmula clave del DQN:
+
+$$
+\text{target}_i = r_i + (1 - \text{done}_i) \cdot \gamma \cdot Q_{\text{target}}\bigl(s'_i,\ \arg\max_{a'} Q_{\text{main}}(s'_i, a')\bigr)
+$$
+
+**Qué significa cada operando:**
+
+| Símbolo | Significado | Valor típico |
+|---|---|---|
+| `target_i` | El "valor verdadero" que queremos que la red prediga para la transición `i`. Escalar. | float |
+| `r_i` | Recompensa inmediata observada al ejecutar `a_i` en `s_i`. | +50, -10, -100, -1.284 |
+| `done_i` | 1 si la transición terminó el episodio, 0 si no. | 0 o 1 |
+| `(1 − done_i)` | "Apaga" el futuro cuando el episodio acabó: si `done=1`, el target = solo `r_i`. | 0 o 1 |
+| `γ` (gamma) | Factor de descuento, 0.9646. Cuánto importa el futuro vs el presente. | ~0.96 |
+| `s'_i` | Estado siguiente (16 features). | tensor |
+| `Q_main(s', a')` | Q-values predichos por la **red principal** para el estado siguiente. | tensor [4] |
+| `argmax_{a'} Q_main(s', a')` | Índice (0-3) de la acción que la red principal cree mejor en `s'`. | int |
+| `Q_target(s', a*)` | Q-value que la **red objetivo** (congelada) le pone a esa acción óptima. | float |
+
+En código [Agent.py:238-246](src/AI_Model/Agent.py#L238):
 
 ```python
-action_idx = agent.get_action(current_view, epsilon)
+# (a) La red principal sugiere qué acción tomar en s'
+next_q_main  = self.model(next_states, training=False).numpy()       # [512, 4]
+best_actions = np.argmax(next_q_main, axis=1)                        # [512]
+
+# (b) La red objetivo evalúa esa acción
+next_q_target = self.target_model(next_states, training=False).numpy()       # [512, 4]
+max_next_q    = next_q_target[np.arange(len(best_actions)), best_actions]    # [512]
+
+# (c) Bellman: r + γ·max_next_q, anulando el futuro si done
+targets = rewards + (1 - dones) * self.gamma * max_next_q             # [512]
 ```
 
-Internamente `get_action` llama a `process_view` para obtener el tensor 16-D,
-hace un forward pass y devuelve el `argmax`.
+**¿Por qué dos redes?** En **DQN clásico** usarías la misma red para elegir
+y evaluar (`max_{a'} Q(s', a')`), lo que sesga los Q-values al alza (el
+ruido positivo en una salida se "auto-confirma"). **Double DQN** rompe
+ese sesgo: la red principal **elige**, la red objetivo **evalúa**. Además,
+la red objetivo es una copia congelada que solo se sincroniza cada 1000
+steps → los targets no se mueven cada update y el aprendizaje es estable.
 
-### 10.4 Paso 3 — ejecutar la acción
+#### Paso 6.4 — Forward de la red + máscara one-hot
 
-[main.py:241,244](src/AI_Model/main.py#L241) → [Board.py:167](src/AI_Model/Board.py#L167):
+Queremos comparar el target con lo que la red predice **para la acción
+que realmente se tomó**, `a_i`. La red da los 4 Q-values, hay que aislar el
+correcto:
 
 ```python
-move_str = directions_map[action_idx]
-new_head, reward = board.move_snake(move_str)
+all_q     = self.model(states, training=True)        # [512, 4]
+masks     = tf.one_hot(actions, self.output_size)    # [512, 4] — 1 en a_i, 0 en el resto
+current_q = tf.reduce_sum(all_q * masks, axis=1)     # [512] — solo Q(s_i, a_i)
 ```
 
-`move_snake` aplica las reglas: detecta colisión (pared, cuerpo propio),
-gestiona comer manzana (`G` crece, `R` encoge — y si el cuerpo está vacío,
-encogerse mata) y devuelve la recompensa primaria. `new_head is None` indica
-colisión.
+| Símbolo | Significado | Shape |
+|---|---|---|
+| `all_q` | Todos los Q-values predichos por la red para `s` | `[B, 4]` |
+| `masks` | Máscara que aísla la acción tomada (`one_hot(a_i)`) | `[B, 4]` |
+| `current_q` | Predicción para la acción que se tomó | `[B]` |
 
-### 10.5 Paso 4 — chequeo de fin de episodio
+Equivale a `all_q[:, a]` pero es más **GPU-friendly** y diferenciable sin
+casos especiales — TensorFlow lo compila bien dentro de `@tf.function`.
 
-[main.py:248-285](src/AI_Model/main.py#L248):
+#### Paso 6.5 — Loss Huber
 
-1. Actualizar `steps_since_food` (cero si el score cambió).
-2. `done = (new_head is None)` por colisión.
-3. Si `steps_since_food >= max_steps_without_food` (calculado en función de
-   la longitud actual, ver sección 6) → `done = True`,
-   `reward = INSTANT_GAMEOVER`.
-4. Si `step_count >= max_steps` → `done = True`, `reward = -50`.
+Comparamos predicción y target:
 
-### 10.6 Paso 5 — guardar la transición
+$$
+L(e) = \begin{cases} \tfrac{1}{2} e^2 & |e| \le \delta \\ \delta (|e| - \tfrac{1}{2}\delta) & |e| > \delta \end{cases}
+\quad\text{con } e = \text{target} - \text{current\_q},\ \delta = 1.0
+$$
 
-[main.py:287,290](src/AI_Model/main.py#L287):
+| Símbolo | Significado |
+|---|---|
+| `e` | Error de predicción para una transición. |
+| `δ` | Umbral (1.0). Marca el corte cuadrática↔lineal. |
+| `L(e)` | Penalización de ese error. |
+
+**Por qué Huber y no MSE**: al inicio del entrenamiento los Q-values son
+ruido y los targets pueden ser enormes; con MSE (`e²`) los gradientes
+explotan. Huber es cuadrática para errores pequeños (suave cerca del
+óptimo) y lineal para errores grandes (robusta a outliers).
+
+#### Paso 6.6 — Backprop + Adam con clipnorm
 
 ```python
-next_view = board.get_snake_view() if not done else current_view
-agent.remember(current_view, action_idx, reward, next_view, done)
+grads = tape.gradient(loss, self.model.trainable_variables)
+self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
 ```
 
-Se guarda la **vista cruda** (no el tensor). Si el episodio terminó, la
-`next_view` es irrelevante; usamos la actual como placeholder.
+1. **`tape.gradient`**: autodiferenciación. Calcula `∂loss/∂θ` para cada peso `θ`.
+2. **Adam** (`lr = 0.000216`): optimizador adaptativo. Mantiene medias móviles
+   del gradiente (`m_t`) y del gradiente al cuadrado (`v_t`), y aplica:
 
-### 10.7 Paso 6 — `replay()` — corazón de DQN
+$$
+\theta_{t+1} = \theta_t - \text{lr} \cdot \frac{m_t}{\sqrt{v_t} + \epsilon_{\text{adam}}}
+$$
 
-[main.py:291](src/AI_Model/main.py#L291) →
-[Agent.py:253](src/AI_Model/Agent.py#L253). Aquí convergen **todos los
-trucos**: experience replay, target network, Double DQN, Huber, Adam, sync.
+   Normaliza cada parámetro por su escala histórica — más estable que SGD puro.
 
-#### 6a — Sample aleatorio del buffer
+3. **`clipnorm = 1.0`**: si la norma global del gradiente supera 1.0, se
+   reescala. Previene divergencias por gradiente explosivo:
+
+$$
+g' = g \cdot \min\!\left(1,\ \frac{1.0}{\|g\|_2}\right)
+$$
+
+**Esta es la única operación que modifica los pesos `θ`** en todo el flujo.
+
+#### Paso 6.7 — Sync de la red objetivo
 
 ```python
-if len(self.memory) < self.batch_size:
-    return None
-minibatch = random.sample(self.memory, self.batch_size)
+if self.train_count % self.target_update_frequency == 0:  # cada 1000 steps
+    self.update_target_model()                            # target ← main
 ```
 
-Si aún no hay 512 transiciones, no hace nada (los primeros pasos del warmup
-sólo llenan el buffer). Después, sample uniforme.
+`update_target_model()` copia los pesos: `target_model.set_weights(model.get_weights())`.
+Entre syncs la red objetivo no se mueve → los targets son estables y el
+aprendizaje converge. Sin este truco el DQN diverge ("persigue su propia sombra").
 
-#### 6b — Codificar el batch
+#### El `@tf.function` envolviendo 6.4–6.6
 
-[Agent.py:267-279](src/AI_Model/Agent.py#L267):
+[Agent.py:190-202](src/AI_Model/Agent.py#L190): los pasos forward + loss +
+backprop están envueltos en `@tf.function`, que **compila** el código Python
+a un grafo TensorFlow estático la primera vez que se llama. Las siguientes
+llamadas ejecutan el grafo directamente, sin pasar por el intérprete Python.
+Multiplica el throughput x3-x10. Los pasos 6.1-6.3 quedan fuera porque hacen
+operaciones Python/NumPy (sample del deque, conversión a features).
 
-```python
-states, next_states, actions, rewards, dones = [], [], [], [], []
-for sv, a, r, nsv, d in minibatch:
-    states.append(self.process_view(sv)[0])
-    next_states.append(self.process_view(nsv)[0])
-    actions.append(a); rewards.append(r); dones.append(d)
+### 10.3 Mapa visual completo
+
+```
+┌─ Memoria (150K transiciones) ────────────────────────┐
+│  random.sample(B=512)                                │
+└──────────────────┬───────────────────────────────────┘
+                   ▼
+   states, actions, rewards, next_states, dones (shape [512, ...])
+                   │
+                   ▼
+   ┌── construir target ──────────────────────────────────────┐
+   │   Q_main(s')   ──argmax──►   a*                          │
+   │   Q_target(s', a*)  ─────►   max_next_q                  │
+   │   targets = r + (1-done) · γ · max_next_q                │
+   └────────────────────────────┬─────────────────────────────┘
+                                │
+   ◄────── @tf.function ────────┤
+   ┌── forward + loss + update ─▼──────────────────────────┐
+   │   Q_main(s)  ──one_hot(a)──►   current_q              │
+   │   loss = Huber(targets, current_q)                    │
+   │   ∂loss/∂θ  ──clipnorm──►  Adam  ──►  θ_new           │
+   └────────────────────────────┬──────────────────────────┘
+                                │
+                                ▼
+              ¿train_count % 1000 == 0?
+                      Sí ──►  Q_target ← Q_main
 ```
 
-→ Aplica el encoder 16-D `1/distancia` a cada visión y construye arrays
-NumPy listos para alimentar a la red.
+### 10.4 Final de cada episodio
 
-#### 6c — Construir el target de Bellman (Double DQN + target network)
+Cuando `done = True`:
 
-[Agent.py:289-295](src/AI_Model/Agent.py#L289):
-
-```python
-next_q_main   = self.model(next_states, training=False).numpy()
-best_actions  = np.argmax(next_q_main, axis=1)               # ① principal SELECCIONA
-next_q_target = self.target_model(next_states, training=False).numpy()
-max_next_q    = next_q_target[np.arange(...), best_actions]  # ② target EVALÚA
-targets       = rewards + (1 - dones) * self.gamma * max_next_q
-```
-
-Tres piezas a la vez: **ecuación de Bellman**, **target network** (red
-estable que aporta `Q(s', ·)`), **Double DQN** (separa selección y
-evaluación).
-
-#### 6d — Paso de gradiente (`_train_step`)
-
-[Agent.py:297](src/AI_Model/Agent.py#L297) llama a
-[`_train_step`](src/AI_Model/Agent.py#L239) (sección 3.4). **Esta es la
-única operación de todo el flujo que modifica los pesos `θ` de la red.**
-
-#### 6e — Sync de la target network cada 1000 pasos
-
-[Agent.py:301-307](src/AI_Model/Agent.py#L301):
-
-```python
-self.train_count += 1
-if self.train_count % self.target_update_frequency == 0:
-    self.update_target_model()
-```
-
-`update_target_model()` ([Agent.py:120](src/AI_Model/Agent.py#L120)) copia
-`self.model.get_weights() → self.target_model`.
-
-### 10.8 Tabla resumen del flujo
-
-| #  | Acción                            | Código                                                         | Pieza DQN                                       |
-|----|-----------------------------------|----------------------------------------------------------------|-------------------------------------------------|
-| 1  | Observar estado `s`               | [Board.py:121](src/AI_Model/Board.py#L121)                     | Estado / observación                            |
-| 2  | Decidir acción `a`                | [Agent.py:221](src/AI_Model/Agent.py#L221)                     | Política ε-greedy                               |
-| 3  | Ejecutar `a` → recibir `r, s'`    | [Board.py:167](src/AI_Model/Board.py#L167)                     | Interacción agente ↔ entorno                    |
-| 4  | Chequeo done                      | [main.py:256-285](src/AI_Model/main.py#L256)                   | Terminación de episodio                         |
-| 5  | Guardar transición                | [Agent.py:235](src/AI_Model/Agent.py#L235)                     | Experience Replay (escritura)                   |
-| 6a | Sample aleatorio del buffer       | [Agent.py:262-265](src/AI_Model/Agent.py#L262)                 | Experience Replay (lectura)                     |
-| 6b | Encoding del batch                | [Agent.py](src/AI_Model/Agent.py) `process_view`               | Encoder 16-D                                    |
-| 6c | Target de Bellman                 | [Agent.py:289-295](src/AI_Model/Agent.py#L289)                 | Bellman + Target net + Double DQN               |
-| 6d | Forward + Huber + backprop + Adam | [Agent.py:239-251](src/AI_Model/Agent.py#L239)                 | **Update de los pesos `θ`**                     |
-| 6e | Sync target network               | [Agent.py:301-307](src/AI_Model/Agent.py#L301)                 | Target network update                           |
-
-### 10.9 Final de cada episodio
-
-[main.py:298-394](src/AI_Model/main.py#L298): cuando `done = True`:
-
-1. **Resumen impreso**: pasos, score final, recompensa total, avg/step.
-   Detallado para los primeros 20 episodios o si `--debug`; resumido en una
-   sola línea para el resto.
+1. **Resumen**: pasos, score final, recompensa total, avg/step.
 2. **Update de stats**: `total_episodes`, `total_score`, `scores`.
-3. **Ruta de guardado** (decidida una sola vez por episodio):
-   - Modo `multi`: `model_dir = "models/multi"`, `name_tag = "multi"`.
-   - Modo `single`: `model_dir = f"models/{board_size}x{board_size}"`,
-     `name_tag = f"{board_size}x{board_size}"`.
+3. **Ruta de guardado**:
+   - `multi`: `models/multi/`, tag `multi`.
+   - `single`: `models/{S}x{S}/`, tag `{S}x{S}`.
 4. **Doble checkpoint**:
-   - Si `final_score > stats['high_score']` → guarda en
-     `{model_dir}/best_snake_{name_tag}_{num_episodes}ep.keras`. Es el high
-     score individual; puede ser un pico afortunado.
-   - Si la **media móvil de 200 episodios** mejora `stats['best_rolling_avg']`
-     → guarda en `{model_dir}/best_avg_snake_{name_tag}_{num_episodes}ep.keras`.
-     Refleja política consistentemente buena, no un golpe de suerte.
-5. Cada checkpoint escribe junto al `.keras` un `*_metadata.json` con `mode`,
-   `board_size` (None en multi), `total_episodes`, `high_score`, etc.
+   - `best_*` si `final_score` > high score (puede ser un pico afortunado).
+   - `best_avg_*` si la **media móvil de 200 episodios** mejora — más fiable.
+5. Cada `.keras` lleva su `*_metadata.json` (mode, board_size, episodios,
+   high_score, ε, timestamp).
 6. **Update de ε** según el schedule de tres fases (sección 7).
 
-Tras el último episodio, [main.py:865-879](src/AI_Model/main.py#L865) guarda
-el **modelo final** en `models/multi/snake_multi_{N}ep_{timestamp}.keras` o
-`models/{S}x{S}/snake_{S}x{S}_{N}ep_{timestamp}.keras`, también con
-metadata.
+Tras el último episodio se guarda el **modelo final** en
+`models/{multi|SxS}/snake_*_{N}ep_{timestamp}.keras` con su metadata.
 
-### 10.10 Mapa mental: dónde entra cada concepto
+### 10.5 Idea clave que se suele olvidar
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   BUCLE DE ENTRENAMIENTO                        │
-│                                                                 │
-│  Paso 1  ←  Estado          (visión cruz, lista de chars)       │
-│  Paso 2  ←  ε-greedy        (process_view → red predictiva)     │
-│  Paso 3  ←  Recompensa r    (creada por el entorno)             │
-│  Paso 4  ←  Detección de done (collision / loop / timeout)      │
-│  Paso 5  ←  Replay buffer   (vistas crudas, no tensores)        │
-│  Paso 6a ←  Replay buffer   (sampling aleatorio)                │
-│  Paso 6b ←  process_view sobre el batch (encoder 16-D)          │
-│  Paso 6c ←  Bellman + Target network + Double DQN               │
-│            (← AQUÍ las recompensas se transforman en targets)   │
-│  Paso 6d ←  Backprop + Huber + Adam                             │
-│            (← AQUÍ los pesos θ de la red cambian)               │
-│  Paso 6e ←  Target network sync                                 │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-Las recompensas viven en el buffer durante muchos pasos antes de "tocar" la
-red. Cuando lo hacen, lo hacen indirectamente: forman el `target` que la red
-persigue.
+Las recompensas **no entran directamente** en la red. Pasan por el replay
+buffer, viven ahí durante muchos steps, y solo "tocan" los pesos cuando
+forman parte del **target de Bellman** que la red persigue (paso 6.3). El
+gradiente real que actualiza θ solo aparece en el paso 6.6.
 
 ---
 
