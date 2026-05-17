@@ -43,30 +43,11 @@ if [ "$(uname -s)" = "Linux" ]; then
         fi
     done
 
-    # System libLLVM. Search any common location with a glob fallback.
-    LLVM_LIB=""
-    for cand in \
-        /usr/lib/x86_64-linux-gnu/libLLVM.so \
-        /usr/lib/x86_64-linux-gnu/libLLVM-*.so* \
-        /usr/lib64/libLLVM.so \
-        /usr/lib64/libLLVM-*.so* \
-        /usr/lib/libLLVM.so \
-        /usr/lib/libLLVM-*.so*
-    do
-        for match in $cand; do
-            if [ -f "$match" ]; then
-                LLVM_LIB="$match"
-                break 2
-            fi
-        done
-    done
-    if [ -n "$LLVM_LIB" ]; then
-        PRELOADS+=("$LLVM_LIB")
-    elif [ -n "$SNAKE_DEBUG" ]; then
-        echo "[snake] WARNING: no system libLLVM found to preload." >&2
-        echo "[snake]   Mesa's swrast_dri may pick up TF's bundled LLVM." >&2
-        echo "[snake]   Install it with: sudo apt install llvm" >&2
-    fi
+    # Intentionally do NOT preload libLLVM: on cluster machines the
+    # system version (e.g. 12) is older than the one TF bundles
+    # (14+) and forcing it makes things worse, not better. Instead
+    # we tell Mesa to use the LLVM-free `softpipe` driver via env
+    # vars set inside main.py (GALLIUM_DRIVER=softpipe).
 
     if [ "${#PRELOADS[@]}" -gt 0 ]; then
         joined="$(IFS=':'; echo "${PRELOADS[*]}")"

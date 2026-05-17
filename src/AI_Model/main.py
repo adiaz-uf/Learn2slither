@@ -53,15 +53,22 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('SDL_VIDEODRIVER', 'x11')
     os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
     # Disable hardware-accelerated framebuffer and force the software
-    # renderer. This stops SDL from loading Mesa's swrast_dri.so / GL
-    # stack, which is what triggers the LLVM-symbol clash with TF on
-    # cluster machines without GPU passthrough.
+    # renderer in SDL itself.
     os.environ.setdefault('SDL_FRAMEBUFFER_ACCELERATION', '0')
     os.environ.setdefault('SDL_RENDER_DRIVER', 'software')
     os.environ.setdefault('SDL_HINT_RENDER_DRIVER', 'software')
     # Disable the EGL/GLX path explicitly so SDL never tries to create
     # a GL context for the window.
     os.environ.setdefault('SDL_VIDEO_X11_FORCE_EGL', '0')
+    # CRUCIAL on cluster machines:
+    # Force Mesa's Gallium loader onto the `softpipe` driver, which
+    # does NOT use LLVM at all (unlike the default `llvmpipe`). When
+    # the user's system libLLVM doesn't match the version TF was built
+    # against (e.g. system has 12, TF bundles 17), llvmpipe segfaults.
+    # softpipe is slower but LLVM-free and rock-solid.
+    os.environ.setdefault('GALLIUM_DRIVER', 'softpipe')
+    # Also ask Mesa to disable any LLVM JIT it could still load.
+    os.environ.setdefault('MESA_LOADER_DRIVER_OVERRIDE', 'softpipe')
 
 # (D) Initialise SDL subsystems BEFORE TensorFlow is imported. Only the
 # ones we actually use (display + font). pygame.init() would also try to
