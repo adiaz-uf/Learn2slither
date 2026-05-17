@@ -265,7 +265,13 @@ class BoardGameUI:
             board_size: full board size including wall border
                         (playable area = board_size - 2).
         """
-        pygame.init()
+        # Use partial init (display + font only) instead of pygame.init()
+        # to avoid bringing up the audio mixer, which is a common cause
+        # of segmentation faults on Linux when no audio server is
+        # reachable. main.py already initialises these subsystems before
+        # TensorFlow is imported; these calls are idempotent no-ops.
+        pygame.display.init()
+        pygame.font.init()
         self.board_size = board_size
         self.BLOCK_SIZE = self.WINDOW_SIZE // board_size
         # Use the exact board pixel size as the window size to avoid the

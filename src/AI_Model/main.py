@@ -21,6 +21,45 @@ import json
 import random
 from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Linux pygame + TensorFlow segfault mitigations.
+#
+# On Linux (especially Wayland + NVIDIA), pygame.display.set_mode() can
+# segfault because:
+#   1. TF loads its own libstdc++ / libgomp that clash with SDL2's.
+#   2. TF reserves the GPU, then SDL tries to create a GL context on it
+#      and the drivers fight.
+#   3. SDL's audio backend (ALSA/PulseAudio) crashes on headless / WSL.
+#   4. SDL2 picks the wayland backend, which is flaky with XWayland apps.
+#
+# All four are addressed below. Every line is a no-op on macOS/Windows.
+# ---------------------------------------------------------------------------
+
+# (1) Force TF onto CPU. Inference for snake is microseconds either way, and
+#     removing CUDA from the picture eliminates the GL/CUDA context fight.
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+# (2) Silence TF startup logs (cosmetic, also reduces stderr noise that can
+#     hide the real crash message).
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+# Linux-only environment hints. macOS/Windows have their own SDL backends
+# and forcing 'x11' would fail with "x11 not available".
+if sys.platform.startswith('linux'):
+    # (3) Pick the X11 backend explicitly. Works on pure X11 and on Wayland
+    #     via XWayland. The wayland-native SDL backend is the usual segfault
+    #     source.
+    os.environ.setdefault('SDL_VIDEODRIVER', 'x11')
+    # (4) Use the dummy audio driver. We don't play sound; this avoids ALSA
+    #     / PulseAudio init crashes when no audio server is reachable.
+    os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
+
+# Initialise SDL subsystems BEFORE TensorFlow is imported, but only the
+# ones we actually use (display + font). pygame.init() would also try to
+# bring up the mixer subsystem, which is the single most common source of
+# pygame segfaults on Linux. Both calls are idempotent — calling them
+# again later (in BoardGameUI, StartScreen, etc.) is harmless.
+pygame.display.init()
+pygame.font.init()
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from UI.game_ui import (  # noqa: E402
@@ -640,7 +679,9 @@ def run_with_ui(agent, board_size, step_by_step=False, fps=10):
         step_by_step: if True, pause after each game step.
         fps: rendering speed (frames per second).
     """
-    pygame.init()
+    # Partial init only (display + font). See top-of-file comment.
+    pygame.display.init()
+    pygame.font.init()
     directions_map = ['UP', 'DOWN', 'LEFT', 'RIGHT']
 
     # Cumulative statistics for the entire session
@@ -964,7 +1005,9 @@ if __name__ == "__main__":
             sys.exit(1)
 
         if args.visual == 'on':
-            pygame.init()
+            # Partial init only (display + font). See top-of-file comment.
+            pygame.display.init()
+            pygame.font.init()
             run_with_ui(
                 agent, board_size,
                 step_by_step=args.step_by_step,
